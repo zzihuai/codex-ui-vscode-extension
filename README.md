@@ -100,8 +100,11 @@ Or set absolute paths via settings (see below).
 3. Publish
 
    ```bash
-   npx @vscode/vsce publish
+   pnpm run vsce:publish
    ```
+
+Note: `--no-dependencies` を付けると、`.vscodeignore` で opt-in していても `node_modules/` が VSIX に入らず、
+起動時に `Cannot find module` でクラッシュします（少なくとも `@iarna/toml` / `shell-quote` が必要）。
 
 ## Specification
 

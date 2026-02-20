@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import type { Personality } from "./generated/Personality";
+import type { CollaborationModeMask } from "./generated/CollaborationModeMask";
 
 export type BackendId = "codex" | "codez" | "opencode";
 
@@ -10,6 +12,8 @@ export type Session = {
   title: string;
   customTitle?: boolean;
   threadId: string;
+  personality?: Personality | null;
+  collaborationModePresetName?: CollaborationModeMask["name"] | null;
 };
 
 export class SessionStore {

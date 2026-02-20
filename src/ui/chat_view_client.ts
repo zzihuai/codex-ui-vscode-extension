@@ -27,16 +27,29 @@ type ModelState = {
   model: string | null;
   provider: string | null;
   reasoning: string | null;
+  agent?: string | null;
 };
 
 type ChatBlock =
-  | { id: string; type: "user"; text: string }
+  | { id: string; type: "user"; text: string; turnId?: string }
   | {
       id: string;
       type: "assistant";
       text: string;
       streaming?: boolean;
       meta?: string | null;
+    }
+  | {
+      id: string;
+      type: "opencodePermission";
+      requestID: string;
+      permission: string;
+      status: "pending" | "replied" | "error";
+      patterns: string[];
+      always: string[];
+      metadata: Record<string, unknown> | null;
+      reply?: "once" | "always" | "reject" | null;
+      error?: string | null;
     }
   | {
       id: string;
@@ -120,6 +133,16 @@ type ChatBlock =
     }
   | {
       id: string;
+      type: "collab";
+      title: string;
+      status: string;
+      tool: string;
+      senderThreadId: string;
+      receiverThreadIds: string[];
+      detail: string;
+    }
+  | {
+      id: string;
       type: "step";
       title: string;
       status: "inProgress" | "completed" | "failed";
@@ -143,7 +166,18 @@ type ChatBlock =
     }
   | { id: string; type: "plan"; title: string; text: string }
   | { id: string; type: "error"; title: string; text: string }
-  | { id: string; type: "system"; title: string; text: string };
+  | { id: string; type: "system"; title: string; text: string }
+  | {
+      id: string;
+      type: "actionCard";
+      title: string;
+      text: string;
+      actions: Array<{
+        id: string;
+        label: string;
+        style?: "primary" | "default";
+      }>;
+    };
 
 type ChatViewState = {
   globalBlocks?: ChatBlock[];
@@ -161,6 +195,7 @@ type ChatViewState = {
   reloading: boolean;
   hydrationBlockedText?: string | null;
   opencodeDefaultModelKey?: string | null;
+  opencodeDefaultAgentName?: string | null;
   cliDefaultModelState?: ModelState | null;
   statusText?: string | null;
   statusTooltip?: string | null;
@@ -170,6 +205,9 @@ type ChatViewState = {
     model: string;
     displayName: string;
     description: string;
+    upgrade?: string | null;
+    inputModalities?: string[] | null;
+    supportsPersonality?: boolean | null;
     supportedReasoningEfforts: Array<{
       reasoningEffort: string;
       description: string;
@@ -177,44 +215,25 @@ type ChatViewState = {
     defaultReasoningEffort: string;
     isDefault: boolean;
   }> | null;
+  collaborationModeLabel?: string | null;
   approvals: Array<{
     requestKey: string;
     title: string;
     detail: string;
     canAcceptForSession: boolean;
   }>;
+  approvalSessionIds?: string[];
   customPrompts?: Array<{
     name: string;
     description: string | null;
     argumentHint: string | null;
     source: string;
   }>;
-};
-
-type AskUserQuestionType = "text" | "single_select" | "multi_select";
-type AskUserQuestionOption = {
-  label: string;
-  value: string;
-  description?: string;
-  recommended?: boolean;
-};
-type AskUserQuestion = {
-  id: string;
-  prompt: string;
-  type: AskUserQuestionType;
-  description?: string;
-  placeholder?: string;
-  options?: AskUserQuestionOption[];
-  allow_other?: boolean;
-  required?: boolean;
-};
-type AskUserQuestionRequest = {
-  title?: string;
-  questions: AskUserQuestion[];
-};
-type AskUserQuestionResponse = {
-  cancelled: boolean;
-  answers: Record<string, unknown>;
+  opencodeAgents?: Array<{
+    id: string;
+    name: string;
+    description?: string;
+  }> | null;
 };
 
 type SuggestItem = {
@@ -222,6 +241,27 @@ type SuggestItem = {
   label: string;
   detail?: string;
   kind: "slash" | "at" | "file" | "dir" | "agent" | "skill";
+};
+
+type RequestUserInputOption = {
+  label: string;
+  description: string;
+};
+
+type RequestUserInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  isOther?: boolean;
+  isSecret?: boolean;
+  options?: RequestUserInputOption[] | null;
+};
+
+type PendingRequestUserInput = {
+  sessionId: string;
+  requestKey: string;
+  questions: RequestUserInputQuestion[];
+  params: unknown;
 };
 
 const WORKTREE_COLORS = [
@@ -266,7 +306,7 @@ function main(): void {
   const hydrateBannerEl = mustGet<HTMLDivElement>("hydrateBanner");
   const logEl = mustGet("log");
   const approvalsEl = mustGet("approvals");
-  const askUserQuestionEl = mustGet("askUserQuestion");
+  const requestUserInputEl = mustGet("requestUserInput");
   const composerEl = mustGet("composer");
   const editBannerEl = mustGet("editBanner");
   const toastEl = mustGet<HTMLDivElement>("toast");
@@ -288,6 +328,10 @@ function main(): void {
   const statusBtn = maybeGet<HTMLButtonElement>("status");
   const tabsEl = mustGet("tabs");
   const modelBarEl = mustGet("modelBar");
+  const modeBadgeEl = document.createElement("span");
+  modeBadgeEl.id = "modeBadge";
+  modeBadgeEl.className = "modeBadge";
+  modeBadgeEl.textContent = "default";
   const footerBarEl = (() => {
     const el = statusTextEl.parentElement;
     if (!el)
@@ -301,6 +345,12 @@ function main(): void {
   modelSelect.className = "modelSelect model";
   const reasoningSelect = document.createElement("select");
   reasoningSelect.className = "modelSelect effort";
+  const agentSelect = document.createElement("select");
+  agentSelect.className = "modelSelect agent";
+  // For opencode sessions, `agentSelect` is used as the Build/Plan mode selector.
+  // Keep it to the left of model selection.
+  modelBarEl.appendChild(agentSelect);
+  modelBarEl.appendChild(modeBadgeEl);
   modelBarEl.appendChild(modelSelect);
   modelBarEl.appendChild(reasoningSelect);
 
@@ -331,14 +381,55 @@ function main(): void {
   );
   placeholderObserver.observe(inputRowEl);
 
-  let askUserQuestionState: {
+  let requestUserInputState: {
     requestKey: string;
-    request: AskUserQuestionRequest;
+    questions: RequestUserInputQuestion[];
     index: number;
-    answers: Record<string, unknown>;
+    answersById: Record<string, string[]>;
     otherTextById: Record<string, string>;
   } | null = null;
-  let askUserQuestionError: string | null = null;
+
+  const pendingRequestUserInputBySessionId = new Map<
+    string,
+    PendingRequestUserInput[]
+  >();
+
+  const enqueueRequestUserInput = (p: PendingRequestUserInput): void => {
+    const q = pendingRequestUserInputBySessionId.get(p.sessionId) ?? [];
+    q.push(p);
+    pendingRequestUserInputBySessionId.set(p.sessionId, q);
+  };
+
+  const dequeueRequestUserInputForSession = (
+    sessionId: string,
+  ): PendingRequestUserInput | null => {
+    const q = pendingRequestUserInputBySessionId.get(sessionId) ?? [];
+    const next = q.shift() ?? null;
+    if (q.length === 0) pendingRequestUserInputBySessionId.delete(sessionId);
+    else pendingRequestUserInputBySessionId.set(sessionId, q);
+    return next;
+  };
+
+  const hasPendingRequestUserInput = (sessionId: string): boolean => {
+    const q = pendingRequestUserInputBySessionId.get(sessionId);
+    return Array.isArray(q) && q.length > 0;
+  };
+
+  const maybeStartRequestUserInputForActiveSession = (): void => {
+    if (requestUserInputState) return;
+    const activeId = state.activeSession?.id ?? null;
+    if (!activeId) return;
+    const pending = dequeueRequestUserInputForSession(activeId);
+    if (!pending) return;
+    requestUserInputState = {
+      requestKey: pending.requestKey,
+      questions: pending.questions,
+      index: 0,
+      answersById: {},
+      otherTextById: {},
+    };
+    renderRequestUserInput();
+  };
 
   const disableComposer = (disabled: boolean): void => {
     inputEl.disabled = disabled;
@@ -347,54 +438,51 @@ function main(): void {
     sendBtn.disabled = disabled;
   };
 
-  const clearAskUserQuestion = (): void => {
-    askUserQuestionState = null;
-    askUserQuestionError = null;
-    askUserQuestionEl.style.display = "none";
-    askUserQuestionEl.innerHTML = "";
-    disableComposer(false);
-    inputEl.focus();
-  };
-
-  const postAskUserQuestionResponse = (
-    response: AskUserQuestionResponse,
-  ): void => {
-    const st = askUserQuestionState;
+  const postRequestUserInputResponse = (cancelled: boolean): void => {
+    const st = requestUserInputState;
     if (!st) return;
+
+    const answers: Record<string, { answers: string[] }> = {};
+    if (!cancelled) {
+      for (const q of st.questions) {
+        answers[q.id] = { answers: st.answersById[q.id] ?? [] };
+      }
+    }
+
     vscode.postMessage({
-      type: "askUserQuestionResponse",
+      type: "requestUserInputResponse",
       requestKey: st.requestKey,
-      response,
+      response: { answers, cancelled },
     });
   };
 
-  const renderAskUserQuestion = (): void => {
-    const st = askUserQuestionState;
+  const clearRequestUserInput = (): void => {
+    requestUserInputState = null;
+    requestUserInputEl.style.display = "none";
+    requestUserInputEl.innerHTML = "";
+    disableComposer(false);
+    inputEl.focus();
+    maybeStartRequestUserInputForActiveSession();
+  };
+
+  const renderRequestUserInput = (): void => {
+    const st = requestUserInputState;
     if (!st) {
-      askUserQuestionEl.style.display = "none";
-      askUserQuestionEl.innerHTML = "";
+      requestUserInputEl.style.display = "none";
+      requestUserInputEl.innerHTML = "";
       disableComposer(false);
       return;
     }
 
-    const title =
-      typeof st.request.title === "string" && st.request.title.trim().length > 0
-        ? st.request.title.trim()
-        : "Codex question";
-
-    const questions = Array.isArray(st.request.questions)
-      ? st.request.questions
-      : [];
-    const q = questions[st.index] ?? null;
-    if (!q || typeof q.id !== "string" || typeof q.prompt !== "string") {
-      postAskUserQuestionResponse({ cancelled: true, answers: st.answers });
-      clearAskUserQuestion();
+    const q = st.questions[st.index] ?? null;
+    if (!q) {
+      postRequestUserInputResponse(false);
+      clearRequestUserInput();
       return;
     }
 
-    // Override the default `.askUserQuestion { display: none; }` stylesheet rule.
-    askUserQuestionEl.style.display = "block";
-    askUserQuestionEl.innerHTML = "";
+    requestUserInputEl.style.display = "block";
+    requestUserInputEl.innerHTML = "";
 
     const card = document.createElement("div");
     card.className = "askCard";
@@ -404,57 +492,20 @@ function main(): void {
 
     const titleNode = document.createElement("div");
     titleNode.className = "askTitle";
-    titleNode.textContent = title;
+    titleNode.textContent = q.header || "Request user input";
 
     const progress = document.createElement("div");
     progress.className = "askProgress";
-    progress.textContent = `${String(st.index + 1)}/${String(questions.length)}`;
+    progress.textContent = `${String(st.index + 1)}/${String(st.questions.length)}`;
 
     header.appendChild(titleNode);
     header.appendChild(progress);
+    card.appendChild(header);
 
     const prompt = document.createElement("div");
     prompt.className = "askPrompt";
-    prompt.textContent = q.prompt;
-
-    card.appendChild(header);
+    prompt.textContent = q.question || "";
     card.appendChild(prompt);
-
-    if (typeof q.description === "string" && q.description) {
-      const desc = document.createElement("div");
-      desc.className = "askDesc";
-      desc.textContent = q.description;
-      card.appendChild(desc);
-    }
-
-    const required = Boolean(q.required);
-    const allowOther = Boolean(q.allow_other);
-    const otherSentinel = "__other__";
-
-    const errorEl = document.createElement("div");
-    errorEl.className = "askError";
-    errorEl.style.display = askUserQuestionError ? "" : "none";
-    errorEl.textContent = askUserQuestionError || "";
-
-    const setError = (msg: string | null): void => {
-      askUserQuestionError = msg;
-      errorEl.textContent = msg || "";
-      errorEl.style.display = msg ? "" : "none";
-    };
-
-    const commitAndAdvance = (answer: unknown | null): void => {
-      setError(null);
-      if (answer === null) delete st.answers[q.id];
-      else st.answers[q.id] = answer;
-
-      st.index += 1;
-      if (st.index >= questions.length) {
-        postAskUserQuestionResponse({ cancelled: false, answers: st.answers });
-        clearAskUserQuestion();
-        return;
-      }
-      renderAskUserQuestion();
-    };
 
     const controls = document.createElement("div");
     controls.className = "askControls";
@@ -463,255 +514,131 @@ function main(): void {
     cancelBtn.className = "askBtn";
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", () => {
-      postAskUserQuestionResponse({ cancelled: true, answers: st.answers });
-      clearAskUserQuestion();
+      postRequestUserInputResponse(true);
+      clearRequestUserInput();
     });
 
     const nextBtn = document.createElement("button");
     nextBtn.className = "askBtn primary";
-    nextBtn.textContent = st.index + 1 >= questions.length ? "Submit" : "Next";
+    nextBtn.textContent =
+      st.index + 1 >= st.questions.length ? "Submit" : "Next";
 
-    const optionsWrap = document.createElement("div");
-    optionsWrap.className = "askOptions";
-
-    const renderOtherInputIfNeeded = (
-      host: HTMLElement,
-      checked: () => boolean,
-      placeholder: string,
-    ): HTMLInputElement => {
-      const input = document.createElement("input");
-      input.className = "askInput";
-      input.placeholder = placeholder;
-      input.value = st.otherTextById[q.id] ?? "";
-      input.addEventListener("input", () => {
-        st.otherTextById[q.id] = input.value;
-        if (checked()) setError(null);
-      });
-      const wrapper = document.createElement("div");
-      wrapper.style.marginTop = "8px";
-      wrapper.appendChild(input);
-      host.appendChild(wrapper);
-      return input;
+    const commitAndAdvance = (answers: string[]): void => {
+      st.answersById[q.id] = answers;
+      st.index += 1;
+      renderRequestUserInput();
     };
 
-    if (q.type === "text") {
-      const input = document.createElement("textarea");
-      input.className = "askInput";
-      input.rows = 3;
-      input.placeholder =
-        typeof q.placeholder === "string" ? q.placeholder : "";
-      input.value =
-        typeof st.answers[q.id] === "string"
-          ? (st.answers[q.id] as string)
-          : "";
-      input.addEventListener("input", () => setError(null));
-      card.appendChild(input);
+    const normalize = (values: unknown[]): string[] =>
+      values.map((v) => String(v ?? "").trim()).filter(Boolean);
 
-      nextBtn.addEventListener("click", () => {
-        const v = input.value.trim();
-        if (required && !v) {
-          setError("This question is required.");
-          input.focus();
-          return;
-        }
-        commitAndAdvance(v ? v : null);
-      });
-    } else if (q.type === "single_select") {
-      const selected =
-        typeof st.answers[q.id] === "string"
-          ? (st.answers[q.id] as string)
-          : null;
+    const otherSentinel = "__other__";
+    const isOther = Boolean(q.isOther);
+    const hasOptions = Array.isArray(q.options) && q.options.length > 0;
 
-      const rawOptions = Array.isArray(q.options) ? q.options : [];
-      const options = rawOptions
-        .slice()
-        .sort(
-          (a, b) =>
-            Number(Boolean(b.recommended)) - Number(Boolean(a.recommended)),
-        );
+    if (hasOptions) {
+      const selected = (st.answersById[q.id]?.[0] ?? "").trim();
 
-      const makeOptionRow = (opt: AskUserQuestionOption): HTMLLabelElement => {
+      const optionsWrap = document.createElement("div");
+      optionsWrap.className = "askOptions";
+
+      const radioName = `rui-${st.requestKey}-${q.id}`;
+
+      const makeRadio = (
+        label: string,
+        value: string,
+        description: string,
+      ): HTMLLabelElement => {
         const row = document.createElement("label");
         row.className = "askOption";
         row.style.cursor = "pointer";
 
-        const radio = document.createElement("input");
-        radio.type = "radio";
-        radio.name = `ask_${st.requestKey}_${q.id}`;
-        radio.value = opt.value;
-        radio.checked = selected === opt.value;
-        radio.addEventListener("change", () => {
-          st.answers[q.id] = opt.value;
-          setError(null);
-          renderAskUserQuestion();
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = radioName;
+        input.value = value;
+        input.checked = selected === value;
+        input.addEventListener("change", () => {
+          if (!input.checked) return;
+          st.answersById[q.id] = [value];
+          renderRequestUserInput();
         });
 
         const meta = document.createElement("div");
-        const label = document.createElement("div");
-        label.className = "askOptionLabel";
-        label.textContent = opt.recommended
-          ? `${opt.label} (Recommended)`
-          : opt.label;
-        meta.appendChild(label);
-        if (opt.description) {
+        const labelEl = document.createElement("div");
+        labelEl.className = "askOptionLabel";
+        labelEl.textContent = label;
+        meta.appendChild(labelEl);
+
+        if (description) {
           const d = document.createElement("div");
           d.className = "askOptionMeta";
-          d.textContent = opt.description;
+          d.textContent = description;
           meta.appendChild(d);
         }
 
-        row.appendChild(radio);
+        row.appendChild(input);
         row.appendChild(meta);
         return row;
       };
 
-      for (const opt of options) optionsWrap.appendChild(makeOptionRow(opt));
-      if (allowOther) {
+      for (const opt of q.options ?? []) {
         optionsWrap.appendChild(
-          makeOptionRow({ label: "Other…", value: otherSentinel }),
+          makeRadio(opt.label, opt.label, opt.description ?? ""),
         );
+      }
+      if (isOther) {
+        optionsWrap.appendChild(makeRadio("Other…", otherSentinel, ""));
       }
       card.appendChild(optionsWrap);
 
       let otherInput: HTMLInputElement | null = null;
-      if (allowOther && selected === otherSentinel) {
-        otherInput = renderOtherInputIfNeeded(
-          card,
-          () => selected === otherSentinel,
-          typeof q.placeholder === "string"
-            ? q.placeholder
-            : "Type your answer…",
-        );
-      }
-
-      nextBtn.addEventListener("click", () => {
-        if (!selected) {
-          if (required) {
-            setError("Pick an option, or cancel.");
-            return;
-          }
-          commitAndAdvance(null);
-          return;
-        }
-
-        if (selected === otherSentinel) {
-          const v = (otherInput?.value ?? st.otherTextById[q.id] ?? "").trim();
-          if (required && !v) {
-            setError("This question is required.");
-            otherInput?.focus();
-            return;
-          }
-          commitAndAdvance(v ? v : null);
-          return;
-        }
-
-        commitAndAdvance(selected);
-      });
-    } else if (q.type === "multi_select") {
-      const prev = Array.isArray(st.answers[q.id])
-        ? (st.answers[q.id] as unknown[])
-        : [];
-      const selected = new Set<string>(prev.map((v) => String(v)));
-
-      const rawOptions = Array.isArray(q.options) ? q.options : [];
-      const options = rawOptions
-        .slice()
-        .sort(
-          (a, b) =>
-            Number(Boolean(b.recommended)) - Number(Boolean(a.recommended)),
-        );
-
-      const makeOptionRow = (opt: AskUserQuestionOption): HTMLLabelElement => {
-        const row = document.createElement("label");
-        row.className = "askOption";
-        row.style.cursor = "pointer";
-
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.value = opt.value;
-        cb.checked = selected.has(opt.value);
-        cb.addEventListener("change", () => {
-          if (cb.checked) selected.add(opt.value);
-          else selected.delete(opt.value);
-          st.answers[q.id] = Array.from(selected);
-          setError(null);
-          renderAskUserQuestion();
+      if (isOther && selected === otherSentinel) {
+        otherInput = document.createElement("input");
+        otherInput.className = "askInput";
+        otherInput.type = q.isSecret ? "password" : "text";
+        otherInput.placeholder = "Type your answer…";
+        otherInput.value = st.otherTextById[q.id] ?? "";
+        otherInput.addEventListener("input", () => {
+          st.otherTextById[q.id] = otherInput?.value ?? "";
         });
-
-        const meta = document.createElement("div");
-        const label = document.createElement("div");
-        label.className = "askOptionLabel";
-        label.textContent = opt.recommended
-          ? `${opt.label} (Recommended)`
-          : opt.label;
-        meta.appendChild(label);
-        if (opt.description) {
-          const d = document.createElement("div");
-          d.className = "askOptionMeta";
-          d.textContent = opt.description;
-          meta.appendChild(d);
-        }
-
-        row.appendChild(cb);
-        row.appendChild(meta);
-        return row;
-      };
-
-      for (const opt of options) optionsWrap.appendChild(makeOptionRow(opt));
-      if (allowOther) {
-        optionsWrap.appendChild(
-          makeOptionRow({ label: "Other…", value: otherSentinel }),
-        );
-      }
-      card.appendChild(optionsWrap);
-
-      let otherInput: HTMLInputElement | null = null;
-      if (allowOther && selected.has(otherSentinel)) {
-        otherInput = renderOtherInputIfNeeded(
-          card,
-          () => selected.has(otherSentinel),
-          typeof q.placeholder === "string"
-            ? q.placeholder
-            : "Type your answer…",
-        );
+        card.appendChild(otherInput);
       }
 
       nextBtn.addEventListener("click", () => {
-        const out: string[] = [];
-        for (const v of selected) {
-          if (v === otherSentinel) continue;
-          out.push(v);
-        }
-
-        if (allowOther && selected.has(otherSentinel)) {
+        const raw = selected;
+        if (isOther && raw === otherSentinel) {
           const other = (
             otherInput?.value ??
             st.otherTextById[q.id] ??
             ""
           ).trim();
-          if (other) out.push(other);
-        }
-
-        if (required && out.length === 0) {
-          setError("Pick at least one option, or cancel.");
+          commitAndAdvance(normalize([other]));
           return;
         }
-
-        commitAndAdvance(out.length > 0 ? out : null);
+        commitAndAdvance(normalize(raw ? [raw] : []));
       });
     } else {
-      setError(`Unsupported question type: ${String((q as any).type)}`);
+      const input = document.createElement("textarea");
+      input.className = "askInput";
+      input.rows = 3;
+      input.placeholder = "Type your answer…";
+      input.value = (st.answersById[q.id]?.[0] ?? "").trim();
+      if (q.isSecret) {
+        input.style.setProperty("-webkit-text-security", "disc");
+      }
+      input.addEventListener("input", () => {});
+      card.appendChild(input);
+
       nextBtn.addEventListener("click", () => {
-        postAskUserQuestionResponse({ cancelled: true, answers: st.answers });
-        clearAskUserQuestion();
+        commitAndAdvance(normalize([input.value]));
       });
     }
 
     controls.appendChild(cancelBtn);
     controls.appendChild(nextBtn);
-    card.appendChild(errorEl);
     card.appendChild(controls);
-    askUserQuestionEl.appendChild(card);
+    requestUserInputEl.appendChild(card);
     disableComposer(true);
   };
 
@@ -903,7 +830,7 @@ function main(): void {
     for (const opt of opts) {
       const o = document.createElement("option");
       o.value = opt;
-      o.textContent = opt === "default" ? "default (CLI config)" : opt;
+      o.textContent = opt === "default" ? "default" : opt;
       if (opt === v) o.selected = true;
       el.appendChild(o);
     }
@@ -932,9 +859,7 @@ function main(): void {
       const o = document.createElement("option");
       o.value = opt.value;
       o.textContent =
-        opt.value === "default"
-          ? opts?.defaultLabel ?? "default (CLI config)"
-          : opt.label;
+        opt.value === "default" ? (opts?.defaultLabel ?? "default") : opt.label;
       if (opt.value === v) o.selected = true;
       el.appendChild(o);
     }
@@ -945,17 +870,23 @@ function main(): void {
       showToast("error", "No session selected.");
       return;
     }
+    const backendId = state.activeSession?.backendId ?? null;
     vscode.postMessage({
       type: "setModel",
       sessionId: domSessionId,
       model: modelSelect.value === "default" ? null : modelSelect.value,
       reasoning:
         reasoningSelect.value === "default" ? null : reasoningSelect.value,
+      agent:
+        backendId === "opencode" && agentSelect.value !== "default"
+          ? agentSelect.value
+          : null,
     });
   };
 
   modelSelect.addEventListener("change", sendModelState);
   reasoningSelect.addEventListener("change", sendModelState);
+  agentSelect.addEventListener("change", sendModelState);
   const suggestEl = mustGet("suggest");
   type PendingImage = { id: string; name: string; url: string };
 
@@ -989,6 +920,26 @@ function main(): void {
   const composerBySessionKey = new Map<string, ComposerState>();
   let activeComposerKey = NO_SESSION_KEY;
   let pendingImages: PendingImage[] = [];
+  let lastModeToggleAt = 0;
+
+  function handleCollaborationModeToggleShortcut(
+    e: KeyboardEvent,
+    scope: "global" | "input",
+  ): boolean {
+    const isShiftTab =
+      e.key === "Tab" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+    const wantsToggle = scope === "input" && isShiftTab;
+    if (!wantsToggle) return false;
+    const sessionId = state.activeSession?.id ?? null;
+    if (!sessionId) return false;
+    const now = Date.now();
+    if (now - lastModeToggleAt < 300) return true;
+    lastModeToggleAt = now;
+    e.preventDefault();
+    e.stopPropagation();
+    vscode.postMessage({ type: "cycleCollaborationMode", sessionId });
+    return true;
+  }
 
   const composerKeyForSessionId = (sessionId: string | null): string =>
     sessionId ?? NO_SESSION_KEY;
@@ -1152,7 +1103,10 @@ function main(): void {
   ): { label: string; tooltip: string } => {
     const title = String(sess.title || "").trim() || "Untitled";
     if (sess.customTitle) return { label: title, tooltip: title };
-    return { label: `${title} #${idx + 1}`, tooltip: title };
+    if (Number.isFinite(idx) && idx >= 0) {
+      return { label: `${title} #${idx + 1}`, tooltip: title };
+    }
+    return { label: title, tooltip: title };
   };
 
   if (typeof markdownit !== "function") {
@@ -1304,12 +1258,40 @@ function main(): void {
   };
 
   let domSessionId: string | null = null;
-  let rewindTurnIndex: number | null = null;
+  let rewindTarget: { turnId: string; turnIndex: number } | null = null;
   const blockElByKey = new Map<string, HTMLElement>();
   let tabsSig: string | null = null;
+  let tabsSigPending: string | null = null;
   let approvalsSig: string | null = null;
   const tabElBySessionId = new Map<string, HTMLDivElement>();
+  let draggingWorkspaceUri: string | null = null;
+  let draggingLabelEl: HTMLElement | null = null;
+  let draggingSession: {
+    workspaceFolderUri: string;
+    sessionId: string;
+  } | null = null;
+  let dropIndicatorEl: HTMLElement | null = null;
+  let dropIndicatorKind: "dropBefore" | "dropAfter" | null = null;
   let isComposing = false;
+
+  const clearDropIndicator = (): void => {
+    if (dropIndicatorEl && dropIndicatorKind) {
+      dropIndicatorEl.classList.remove(dropIndicatorKind);
+    }
+    dropIndicatorEl = null;
+    dropIndicatorKind = null;
+  };
+
+  const setDropIndicator = (
+    el: HTMLElement,
+    kind: "dropBefore" | "dropAfter",
+  ): void => {
+    if (dropIndicatorEl === el && dropIndicatorKind === kind) return;
+    clearDropIndicator();
+    dropIndicatorEl = el;
+    dropIndicatorKind = kind;
+    el.classList.add(kind);
+  };
 
   const syncTabGroupLabelWidths = (): void => {
     const groups = tabsEl.querySelectorAll<HTMLElement>(".tabGroup");
@@ -1328,6 +1310,26 @@ function main(): void {
     syncTabGroupLabelWidths(),
   );
   tabsResizeObserver.observe(tabsEl);
+
+  tabsEl.addEventListener("dragover", (e) => {
+    if (!draggingWorkspaceUri) return;
+    if ((e.target as HTMLElement | null)?.closest(".tabGroup")) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    clearDropIndicator();
+  });
+  tabsEl.addEventListener("drop", (e) => {
+    if (!draggingWorkspaceUri) return;
+    if ((e.target as HTMLElement | null)?.closest(".tabGroup")) return;
+    e.preventDefault();
+    vscode.postMessage({
+      type: "moveWorkspaceTab",
+      workspaceFolderUri: draggingWorkspaceUri,
+      targetWorkspaceFolderUri: null,
+      position: "end",
+    });
+    clearDropIndicator();
+  });
 
   type SettingsResponseResult =
     | { ok: true; data: unknown }
@@ -1483,8 +1485,8 @@ function main(): void {
       help.className = "settingsHelp";
       help.textContent =
         settingsSessionBackendId === "opencode"
-          ? "opencode の履歴は codex/codez と互換がないため、このセッションを codex/codez へ引き継ぐことはできません。"
-          : "codex と codez は履歴形式が互換のため、このスレッドは codex/codez のどちらでも開き直せます（opencode へは引き継げません）。";
+          ? "opencode history is not compatible with codex/codez, so this session cannot be carried over to codex/codez."
+          : "codex and codez share a compatible history format, so you can reopen this thread in either codex or codez (but not in opencode).";
       sectionSession.appendChild(help);
 
       const actions = document.createElement("div");
@@ -1591,7 +1593,7 @@ function main(): void {
         const msg = document.createElement("div");
         msg.className = "settingsHelp";
         msg.textContent =
-          "アカウントの作成/切り替えは codez セッションのみ対応です。";
+          "Account creation/switching is supported for codez sessions only.";
         sectionAcct.appendChild(msg);
       }
 
@@ -1675,7 +1677,7 @@ function main(): void {
               const msg =
                 typeof (res.data as any).message === "string"
                   ? String((res.data as any).message)
-                  : "アカウントの作成/切り替えは codez 選択時のみ対応です。";
+                  : "Account creation/switching is supported when codez is selected.";
               showToast("info", msg, 4000);
               renderSettings();
               return;
@@ -1761,11 +1763,11 @@ function main(): void {
               const msg =
                 typeof (res.data as any).message === "string"
                   ? String((res.data as any).message)
-                  : "アカウントの作成/切り替えは codez 選択時のみ対応です。";
-              showToast("info", msg, 4000);
-              renderSettings();
-              return;
-            }
+                  : "Account creation/switching is supported when codez is selected.";
+                showToast("info", msg, 4000);
+                renderSettings();
+                return;
+              }
 
             const migratedLegacy =
               res.data &&
@@ -2366,7 +2368,7 @@ function main(): void {
       imgEl.style.cursor = "pointer";
       const caption = (imageRef.caption || "").trim();
       captionEl.textContent =
-        caption || "画像はオフロードされています（クリックで読み込み）";
+        caption || "Image is offloaded (click to load)";
       captionEl.style.display = "";
       imgEl.addEventListener(
         "click",
@@ -2379,12 +2381,12 @@ function main(): void {
       return;
     }
 
-    captionEl.textContent = "画像を読み込み中…";
+    captionEl.textContent = "Loading image…";
     captionEl.style.display = "";
 
     const res = await requestImageData(imageKey);
     if (!res.ok) {
-      captionEl.textContent = `画像の読み込みに失敗: ${res.error}`;
+      captionEl.textContent = `Failed to load image: ${res.error}`;
       captionEl.style.display = "";
       return;
     }
@@ -2462,6 +2464,36 @@ function main(): void {
       insert: "/mcp ",
       label: "/mcp",
       detail: "List MCP servers",
+      kind: "slash",
+    },
+    {
+      insert: "/apps ",
+      label: "/apps",
+      detail: "Browse apps",
+      kind: "slash",
+    },
+    {
+      insert: "/collab ",
+      label: "/collab",
+      detail: "Change collaboration mode",
+      kind: "slash",
+    },
+    {
+      insert: "/personality ",
+      label: "/personality",
+      detail: "Set personality",
+      kind: "slash",
+    },
+    {
+      insert: "/debug-config ",
+      label: "/debug-config",
+      detail: "Show config details",
+      kind: "slash",
+    },
+    {
+      insert: "/experimental ",
+      label: "/experimental",
+      detail: "Toggle experimental features",
       kind: "slash",
     },
     {
@@ -2726,7 +2758,12 @@ function main(): void {
     sum.appendChild(icon);
     det.appendChild(sum);
     blockElByKey.set(key, det);
-    logEl.appendChild(det);
+    // Keep notices at the top of the log (they're not part of the conversation stream).
+    if (/\bnotice\b/.test(className)) {
+      logEl.insertBefore(det, logEl.firstChild);
+    } else {
+      logEl.appendChild(det);
+    }
     return det;
   }
 
@@ -2905,7 +2942,9 @@ function main(): void {
     const det = document.createElement("details");
     det.className = className;
     det.open = isOpen(onToggleKey, openDefault);
-    det.addEventListener("toggle", () => saveDetailsState(onToggleKey, det.open));
+    det.addEventListener("toggle", () =>
+      saveDetailsState(onToggleKey, det.open),
+    );
     const sum = document.createElement("summary");
     const txt = document.createElement("span");
     txt.dataset.k = "summaryText";
@@ -3569,31 +3608,118 @@ function main(): void {
     renderBlocks(s);
   }
 
+  function normalizeFsPath(p: string): string {
+    const trimmed = String(p || "").trim();
+    if (!trimmed) return "";
+    if (trimmed === "/") return "/";
+    return trimmed.replace(/\/+$/, "");
+  }
+
+  function workspacePathForSession(sess: Session): string {
+    return normalizeFsPath(uriToHashKey(String(sess.workspaceFolderUri || "")));
+  }
+
+  function shouldShowGlobalBlock(
+    block: ChatBlock,
+    sess: Session | null,
+  ): boolean {
+    if (!sess) return true;
+
+    const id = String((block as any).id || "");
+    const title = "title" in block ? String((block as any).title || "") : "";
+    if (block.type !== "info") return true;
+
+    const activeBackendId = sess.backendId;
+    const activeCwd = workspacePathForSession(sess);
+
+    if (title === "Thread started") {
+      const backendPrefix = "global:threadStarted:backend:";
+      const legacyCwdPrefix = "global:threadStarted:cwd:";
+      if (id.startsWith(backendPrefix)) {
+        const rest = id.slice(backendPrefix.length);
+        const idx = rest.indexOf(":cwd:");
+        if (idx <= 0) return false;
+        const backendId = rest.slice(0, idx);
+        const cwd = normalizeFsPath(rest.slice(idx + ":cwd:".length));
+        return backendId === activeBackendId && cwd === activeCwd;
+      }
+      if (id.startsWith(legacyCwdPrefix)) {
+        const cwd = normalizeFsPath(id.slice(legacyCwdPrefix.length));
+        return activeBackendId !== "opencode" && cwd === activeCwd;
+      }
+    }
+
+    if (title === "OpenCode started") {
+      const prefix = "global:opencodeStarted:cwd:";
+      if (!id.startsWith(prefix)) return true;
+      const cwd = normalizeFsPath(id.slice(prefix.length));
+      return activeBackendId === "opencode" && cwd === activeCwd;
+    }
+
+    return true;
+  }
+
   function renderControl(s: ChatViewState): void {
     state = s;
-    titleEl.textContent = s.activeSession
-      ? getSessionDisplayTitle(
-          s.activeSession,
-          (s.sessions || []).findIndex((x) => x.id === s.activeSession!.id),
-        ).label
-      : "Codex UI (no session selected)";
+    titleEl.textContent = (() => {
+      const active = s.activeSession;
+      if (!active) return "Codex UI (no session selected)";
+      let idx = -1;
+      if (!active.customTitle) {
+        const sessionsList = s.sessions || [];
+        let seen = 0;
+        for (const sess of sessionsList) {
+          if (sess.backendId !== active.backendId) continue;
+          if (sess.workspaceFolderUri !== active.workspaceFolderUri) continue;
+          if (sess.id === active.id) {
+            idx = seen;
+            break;
+          }
+          seen += 1;
+        }
+      }
+      return getSessionDisplayTitle(active, idx).label;
+    })();
 
     const ms = s.modelState || {
       model: null,
       provider: null,
       reasoning: null,
     };
+    const modeLabel =
+      typeof s.collaborationModeLabel === "string" &&
+      s.collaborationModeLabel.trim()
+        ? s.collaborationModeLabel.trim()
+        : "Default";
+    modeBadgeEl.textContent = modeLabel;
+    modeBadgeEl.style.display = s.activeSession ? "" : "none";
     const models = s.models ?? [];
     const backendId = s.activeSession?.backendId ?? null;
+    const modelKey = (m: { id?: string; model?: string } | null): string => {
+      if (!m) return "";
+      return String((m as any).id || (m as any).model || "").trim();
+    };
+    const modelKeyAliases = (
+      m: { id?: string; model?: string } | null,
+    ): string[] => {
+      if (!m) return [];
+      const id = String((m as any).id || "").trim();
+      const model = String((m as any).model || "").trim();
+      return [id, model].filter(
+        (v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx,
+      );
+    };
     const opencodeDefaultKey =
       backendId === "opencode" ? String(s.opencodeDefaultModelKey || "") : "";
     const opencodeDefaultDisplay = (() => {
       if (backendId !== "opencode") return null;
       if (!opencodeDefaultKey) return "default (opencode config)";
       const match = models.find(
-        (m) => (m.model || m.id) === opencodeDefaultKey,
+        (m) => modelKey(m) === opencodeDefaultKey.trim(),
       );
-      const label = match?.displayName ? match.displayName : opencodeDefaultKey;
+      const label = match?.displayName
+        ? String(match.displayName).trim()
+        : opencodeDefaultKey.trim();
       return `default (opencode: ${label})`;
     })();
     const cliDefaultDisplay = (() => {
@@ -3605,28 +3731,93 @@ function main(): void {
       };
       const provider = d.provider ? String(d.provider).trim() : "";
       const model = d.model ? String(d.model).trim() : "";
-      if (provider && model) return `default (CLI config: ${provider} / ${model})`;
+      if (provider && model)
+        return `default (CLI config: ${provider} / ${model})`;
       if (provider) return `default (CLI config: ${provider} / default)`;
       if (model) return `default (CLI config: ${model})`;
       const backendDefault = models.find((m) => Boolean(m.isDefault));
       if (backendDefault) {
         const label = String(
-          backendDefault.displayName || backendDefault.model || backendDefault.id,
-        );
+          backendDefault.displayName ||
+            backendDefault.model ||
+            backendDefault.id,
+        ).trim();
         return `default (${backendId || "backend"}: ${label})`;
       }
       return "default (CLI config)";
     })();
+    const modelKeys = new Set(
+      models.flatMap((m) => modelKeyAliases(m)).filter((k) => Boolean(k)),
+    );
+    const visibleModels = models.filter((m) => {
+      const upgrade = typeof m.upgrade === "string" ? m.upgrade.trim() : "";
+      // If a model is known to be auto-upgraded to another model that we can already
+      // pick explicitly, hide the alias to avoid confusing duplicates.
+      if (upgrade && modelKeys.has(upgrade)) return false;
+      return true;
+    });
+    const dedupedModels = (() => {
+      const out: typeof visibleModels = [];
+      const seen = new Set<string>();
+      for (const m of visibleModels) {
+        const key = modelKey(m);
+        if (!key) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(m);
+      }
+      return out;
+    })();
     const modelOptions = [
       { value: "default", label: "default" },
-      ...models.map((m) => ({
-        value: String(m.model || m.id),
-        label: String(m.displayName || m.model || m.id),
+      ...dedupedModels.map((m) => ({
+        value: modelKey(m),
+        label: (() => {
+          const base = String(m.displayName || m.model || m.id).trim();
+          const upgrade =
+            typeof m.upgrade === "string" && m.upgrade.trim()
+              ? ` (upgrade → ${m.upgrade.trim()})`
+              : "";
+          return base + upgrade;
+        })(),
       })),
     ];
+    const selectedModelKey = String(ms.model || "").trim() || "default";
+    const defaultModelLabel = (() => {
+      if (backendId === "opencode") {
+        if (!opencodeDefaultKey) return "default";
+        const match = models.find(
+          (m) => modelKey(m) === opencodeDefaultKey.trim(),
+        );
+        return String(match?.displayName || opencodeDefaultKey);
+      }
+      const d = s.cliDefaultModelState || {
+        model: null,
+        provider: null,
+        reasoning: null,
+      };
+      const provider = d.provider ? String(d.provider).trim() : "";
+      const model = d.model ? String(d.model).trim() : "";
+      if (provider && model) return `${provider} / ${model}`;
+      if (provider) return `${provider} / default`;
+      if (model) return model;
+      const backendDefault = models.find((m) => Boolean(m.isDefault));
+      if (backendDefault) {
+        const label = String(
+          backendDefault.displayName ||
+            backendDefault.model ||
+            backendDefault.id,
+        );
+        return label;
+      }
+      return "default";
+    })();
+    modelSelect.title = selectedModelKey === "default" ? defaultModelLabel : "";
     populateSelectWithLabels(modelSelect, modelOptions, ms.model, {
       defaultLabel:
-        backendId === "opencode" ? opencodeDefaultDisplay : cliDefaultDisplay,
+        (backendId === "opencode"
+          ? opencodeDefaultDisplay
+          : cliDefaultDisplay) ?? `default (${defaultModelLabel})`,
     });
 
     const effortOptions = (() => {
@@ -3646,7 +3837,68 @@ function main(): void {
         return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
       return ["default", ...supported];
     })();
-    populateSelect(reasoningSelect, effortOptions, ms.reasoning);
+    const defaultReasoningLabel = (() => {
+      if (backendId === "opencode") {
+        // opencode does not expose the effective default variant/effort; show the explicit options instead.
+        return "server default";
+      }
+      const d = s.cliDefaultModelState || {
+        model: null,
+        provider: null,
+        reasoning: null,
+      };
+      const reasoning = d.reasoning ? String(d.reasoning).trim() : "";
+      if (reasoning) return reasoning;
+      const backendDefault = models.find((m) => Boolean(m.isDefault));
+      if (backendDefault) {
+        const eff = String(backendDefault.defaultReasoningEffort || "").trim();
+        if (eff) return eff;
+      }
+      return "default";
+    })();
+    const reasoningOptions = effortOptions.map((v) => ({
+      value: v,
+      label: v === "default" ? defaultReasoningLabel : v,
+    }));
+    const selectedReasoningKey = String(ms.reasoning || "").trim() || "default";
+    reasoningSelect.title =
+      selectedReasoningKey === "default" ? defaultReasoningLabel : "";
+    populateSelectWithLabels(reasoningSelect, reasoningOptions, ms.reasoning, {
+      defaultLabel: defaultReasoningLabel,
+    });
+
+    // Mode selector for opencode sessions (Build/Plan)
+    const agents = s.opencodeAgents ?? [];
+    if (backendId === "opencode") {
+      agentSelect.style.display = "";
+      const buildLabel =
+        agents.find(
+          (a) =>
+            String(a.id || "")
+              .trim()
+              .toLowerCase() === "build",
+        )?.name || "build";
+      const planLabel =
+        agents.find(
+          (a) =>
+            String(a.id || "")
+              .trim()
+              .toLowerCase() === "plan",
+        )?.name || "plan";
+      const agentOptions = [
+        { value: "default", label: "default" },
+        { value: "build", label: buildLabel },
+        { value: "plan", label: planLabel },
+      ];
+      const defaultAgent = String(s.opencodeDefaultAgentName || "").trim();
+      const defaultAgentLabel = defaultAgent || "default";
+      agentSelect.title = defaultAgent ? `default_agent=${defaultAgent}` : "";
+      populateSelectWithLabels(agentSelect, agentOptions, ms.agent ?? null, {
+        defaultLabel: defaultAgentLabel,
+      });
+    } else {
+      agentSelect.style.display = "none";
+    }
 
     const fullStatus = String(s.statusText || "").trim();
     const statusTooltip = String(s.statusTooltip || fullStatus).trim();
@@ -3718,7 +3970,7 @@ function main(): void {
     sendBtn.title = s.sending ? "Stop (Esc)" : "Send (Enter)";
     if (statusBtn) statusBtn.disabled = !s.activeSession || s.sending;
     resumeBtn.disabled = s.sending;
-    attachBtn.disabled = !s.activeSession;
+    attachBtn.disabled = !s.activeSession || !allowsImageInputs(s);
     reloadBtn.disabled =
       !s.activeSession || s.sending || s.reloading || backendId !== "codez";
     reloadBtn.title =
@@ -3729,11 +3981,10 @@ function main(): void {
     settingsBtn.title = backendId
       ? `Settings (session backend: ${backendId})`
       : "Settings";
-    if (backendId !== "codez" && rewindTurnIndex !== null) setEditMode(null);
+    if (backendId !== "codez" && backendId !== "opencode" && rewindTarget !== null) setEditMode(null);
     // Keep input enabled so the user can draft messages even before selecting a session,
-    // but do not override ask_user_question which intentionally locks the composer.
     // Sending is still guarded by sendBtn.disabled and sendCurrentInput().
-    if (!askUserQuestionState) inputEl.disabled = false;
+    inputEl.disabled = false;
     updateInputPlaceholder();
 
     const hydrationText = String(s.hydrationBlockedText || "").trim();
@@ -3770,16 +4021,32 @@ function main(): void {
     const sessionsList = s.sessions || [];
     const unread = new Set<string>(s.unreadSessionIds || []);
     const running = new Set<string>(s.runningSessionIds || []);
+    const approvalsNeeded = new Set<string>(s.approvalSessionIds || []);
     const activeId = s.activeSession ? s.activeSession.id : null;
     const workspaceColorOverrides = s.workspaceColorOverrides || {};
     const overridesSig = workspaceOverridesSig(workspaceColorOverrides);
 
-    const nextTabsSig = sessionsList
-      .map((sess, idx) => {
+    // The tab UI groups sessions by workspace folder; match the Sessions tree numbering
+    // (index within workspace + backend), rather than using the global session index.
+    const visibleSessions = sessionsList;
+    const displayIndexBySessionId = new Map<string, number>();
+    const nextIndexByGroupKey = new Map<string, number>();
+    for (const sess of visibleSessions) {
+      const groupKey = `${sess.workspaceFolderUri}\t${sess.backendId}`;
+      const next = nextIndexByGroupKey.get(groupKey) ?? 0;
+      displayIndexBySessionId.set(sess.id, next);
+      nextIndexByGroupKey.set(groupKey, next + 1);
+    }
+
+    const nextTabsSig = visibleSessions
+      .map((sess) => {
         const isUnread = unread.has(sess.id);
         const isRunning = running.has(sess.id);
         const isActive = activeId === sess.id;
-        const dt = getSessionDisplayTitle(sess, idx);
+        const needsApproval = approvalsNeeded.has(sess.id);
+        const needsInput = hasPendingRequestUserInput(sess.id) || needsApproval;
+        const displayIdx = displayIndexBySessionId.get(sess.id) ?? -1;
+        const dt = getSessionDisplayTitle(sess, displayIdx);
         return [
           sess.id,
           sess.workspaceFolderUri,
@@ -3788,32 +4055,47 @@ function main(): void {
           isActive ? "a" : "",
           isRunning ? "r" : "",
           isUnread ? "u" : "",
+          needsInput ? "i" : "",
+          needsApproval ? "p" : "",
         ].join("\t");
       })
       .join("\n");
 
     const sig = `${overridesSig}\n${nextTabsSig}`;
+    const isDraggingTabs = draggingWorkspaceUri !== null || draggingSession !== null;
 
-    if (tabsSig !== sig) {
+    if (isDraggingTabs) {
+      // If we rebuild the tab DOM while a drag is in progress, Chromium cancels the drag operation.
+      // Keep the existing DOM stable, and refresh once the drag ends.
+      if (tabsSig !== sig) tabsSigPending = sig;
+    } else if (tabsSig !== sig) {
       tabsSig = sig;
+      tabsSigPending = null;
       const frag = document.createDocumentFragment();
       const wanted = new Set<string>();
       const groupElByWorkspaceUri = new Map<string, HTMLDivElement>();
       const groupTabsElByWorkspaceUri = new Map<string, HTMLDivElement>();
       const groupOrder: string[] = [];
 
-      sessionsList.forEach((sess, idx) => {
+      visibleSessions.forEach((sess) => {
         wanted.add(sess.id);
         const isUnread = unread.has(sess.id);
         const isRunning = running.has(sess.id);
         const isActive = activeId === sess.id;
-        const dt = getSessionDisplayTitle(sess, idx);
+        const needsApproval = approvalsNeeded.has(sess.id);
+        const needsInput = hasPendingRequestUserInput(sess.id) || needsApproval;
+        const displayIdx = displayIndexBySessionId.get(sess.id) ?? -1;
+        const dt = getSessionDisplayTitle(sess, displayIdx);
+        const tooltip = needsApproval
+          ? `${dt.tooltip}\n\nApproval required`
+          : dt.tooltip;
 
         const groupKey = sess.workspaceFolderUri;
         let groupEl = groupElByWorkspaceUri.get(groupKey);
         if (!groupEl) {
           groupEl = document.createElement("div") as HTMLDivElement;
           groupEl.className = "tabGroup";
+          groupEl.dataset.workspaceFolderUri = groupKey;
 
           const wt = workspaceTagFromUri(groupKey, workspaceColorOverrides);
           groupEl.style.setProperty("--wt-color", wt.color);
@@ -3821,6 +4103,7 @@ function main(): void {
           const labelEl = document.createElement("div") as HTMLDivElement;
           labelEl.className = "tabGroupLabel";
           labelEl.textContent = wt.label;
+          labelEl.draggable = true;
           labelEl.addEventListener("contextmenu", (e) => {
             e.preventDefault();
             vscode.postMessage({
@@ -3828,12 +4111,82 @@ function main(): void {
               workspaceFolderUri: groupKey,
             });
           });
+          labelEl.addEventListener("dragstart", (e) => {
+            draggingWorkspaceUri = groupKey;
+            draggingLabelEl = labelEl;
+            labelEl.classList.add("dragging");
+            if (e.dataTransfer) {
+              e.dataTransfer.effectAllowed = "move";
+              // Some webview environments require a payload for DnD to work reliably.
+              e.dataTransfer.setData("text/plain", groupKey);
+            }
+          });
+          labelEl.addEventListener("dragend", () => {
+            draggingWorkspaceUri = null;
+            if (draggingLabelEl) draggingLabelEl.classList.remove("dragging");
+            draggingLabelEl = null;
+            clearDropIndicator();
+            if (tabsSigPending !== null) {
+              // Force a refresh now that dragging has ended.
+              tabsSig = null;
+              tabsSigPending = null;
+              renderControl(state);
+            }
+          });
+          labelEl.addEventListener("dragover", (e) => {
+            if (!draggingWorkspaceUri) return;
+            if (draggingWorkspaceUri === groupKey) return;
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+            const r = groupEl!.getBoundingClientRect();
+            const mid = r.left + r.width / 2;
+            const kind = e.clientX < mid ? "dropBefore" : "dropAfter";
+            setDropIndicator(groupEl!, kind);
+          });
+          labelEl.addEventListener("drop", (e) => {
+            if (!draggingWorkspaceUri) return;
+            if (draggingWorkspaceUri === groupKey) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const r = groupEl!.getBoundingClientRect();
+            const mid = r.left + r.width / 2;
+            const position = e.clientX < mid ? "before" : "after";
+            vscode.postMessage({
+              type: "moveWorkspaceTab",
+              workspaceFolderUri: draggingWorkspaceUri,
+              targetWorkspaceFolderUri: groupKey,
+              position,
+            });
+            clearDropIndicator();
+          });
           groupEl.appendChild(labelEl);
 
-          const tabsEl = document.createElement("div") as HTMLDivElement;
-          tabsEl.className = "tabGroupTabs";
-          groupEl.appendChild(tabsEl);
-          groupTabsElByWorkspaceUri.set(groupKey, tabsEl);
+          const groupTabsEl = document.createElement("div") as HTMLDivElement;
+          groupTabsEl.className = "tabGroupTabs";
+          groupTabsEl.dataset.workspaceFolderUri = groupKey;
+          groupTabsEl.addEventListener("dragover", (e) => {
+            if (!draggingSession) return;
+            if (draggingSession.workspaceFolderUri !== groupKey) return;
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+            clearDropIndicator();
+          });
+          groupTabsEl.addEventListener("drop", (e) => {
+            if (!draggingSession) return;
+            if (draggingSession.workspaceFolderUri !== groupKey) return;
+            e.preventDefault();
+            e.stopPropagation();
+            vscode.postMessage({
+              type: "moveSessionTab",
+              workspaceFolderUri: groupKey,
+              sessionId: draggingSession.sessionId,
+              targetSessionId: null,
+              position: "end",
+            });
+            clearDropIndicator();
+          });
+          groupEl.appendChild(groupTabsEl);
+          groupTabsElByWorkspaceUri.set(groupKey, groupTabsEl);
 
           groupElByWorkspaceUri.set(groupKey, groupEl);
           groupOrder.push(groupKey);
@@ -3848,20 +4201,104 @@ function main(): void {
           existing ?? (document.createElement("div") as HTMLDivElement);
         if (!existing) {
           tabElBySessionId.set(sess.id, div);
-          div.addEventListener("click", () =>
-            vscode.postMessage({ type: "selectSession", sessionId: sess.id }),
-          );
+          div.draggable = true;
+          div.addEventListener("click", () => {
+            if (requestUserInputState) {
+              showToast("info", "Answer the questions to continue.");
+              return;
+            }
+            const active = state.activeSession?.id ?? null;
+            if (
+              active &&
+              sess.id !== active &&
+              (state.approvals || []).length > 0
+            ) {
+              showToast("info", "Select an approval decision to continue.");
+              return;
+            }
+            vscode.postMessage({ type: "selectSession", sessionId: sess.id });
+          });
           div.addEventListener("contextmenu", (e) => {
             e.preventDefault();
             vscode.postMessage({ type: "sessionMenu", sessionId: sess.id });
           });
+          div.addEventListener("dragstart", (e) => {
+            const workspaceFolderUri = String(
+              div.dataset.workspaceFolderUri || "",
+            );
+            const sessionId = String(div.dataset.sessionId || "");
+            if (!workspaceFolderUri || !sessionId) return;
+            draggingSession = { workspaceFolderUri, sessionId };
+            div.classList.add("dragging");
+            if (e.dataTransfer) {
+              e.dataTransfer.effectAllowed = "move";
+              // Some webview environments require a payload for DnD to work reliably.
+              e.dataTransfer.setData("text/plain", sessionId);
+            }
+          });
+          div.addEventListener("dragend", () => {
+            draggingSession = null;
+            div.classList.remove("dragging");
+            clearDropIndicator();
+            if (tabsSigPending !== null) {
+              // Force a refresh now that dragging has ended.
+              tabsSig = null;
+              tabsSigPending = null;
+              renderControl(state);
+            }
+          });
+          div.addEventListener("dragover", (e) => {
+            if (!draggingSession) return;
+            const targetWorkspaceUri = String(
+              div.dataset.workspaceFolderUri || "",
+            );
+            const targetSessionId = String(div.dataset.sessionId || "");
+            if (!targetWorkspaceUri || !targetSessionId) return;
+            if (draggingSession.workspaceFolderUri !== targetWorkspaceUri)
+              return;
+            if (draggingSession.sessionId === targetSessionId) return;
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+            const r = div.getBoundingClientRect();
+            const mid = r.left + r.width / 2;
+            const kind = e.clientX < mid ? "dropBefore" : "dropAfter";
+            setDropIndicator(div, kind);
+          });
+          div.addEventListener("drop", (e) => {
+            if (!draggingSession) return;
+            const targetWorkspaceUri = String(
+              div.dataset.workspaceFolderUri || "",
+            );
+            const targetSessionId = String(div.dataset.sessionId || "");
+            if (!targetWorkspaceUri || !targetSessionId) return;
+            if (draggingSession.workspaceFolderUri !== targetWorkspaceUri)
+              return;
+            if (draggingSession.sessionId === targetSessionId) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const r = div.getBoundingClientRect();
+            const mid = r.left + r.width / 2;
+            const position = e.clientX < mid ? "before" : "after";
+            vscode.postMessage({
+              type: "moveSessionTab",
+              workspaceFolderUri: targetWorkspaceUri,
+              sessionId: draggingSession.sessionId,
+              targetSessionId,
+              position,
+            });
+            clearDropIndicator();
+          });
         }
+        div.dataset.sessionId = sess.id;
+        div.dataset.workspaceFolderUri = sess.workspaceFolderUri;
+        div.draggable = true;
         div.className =
           "tab" +
           (isActive ? " active" : "") +
+          (needsInput ? " needsInput" : "") +
           (isRunning ? " running" : isUnread ? " unread" : "");
         if (div.textContent !== dt.label) div.textContent = dt.label;
-        if (div.title !== dt.tooltip) div.title = dt.tooltip;
+        if (div.title !== tooltip) div.title = tooltip;
         groupTabsEl.appendChild(div);
       });
 
@@ -3912,6 +4349,8 @@ function main(): void {
         }
       }
     }
+
+    maybeStartRequestUserInputForActiveSession();
 
     const approvals = s.approvals || [];
     const approvalsVisible = Boolean(s.activeSession && approvals.length > 0);
@@ -4001,7 +4440,9 @@ function main(): void {
       approvalsEl.style.display = approvalsVisible ? "" : "none";
     }
 
-    const globalBlocks = s.globalBlocks || [];
+    const globalBlocks = (s.globalBlocks || []).filter((b) =>
+      shouldShowGlobalBlock(b, s.activeSession),
+    );
     if (globalBlocks.length > 0) {
       for (const block of globalBlocks) {
         const id = "global:" + block.type + ":" + block.id;
@@ -4069,8 +4510,74 @@ function main(): void {
     const forceScrollToBottom = forceScrollToBottomNextRender;
     forceScrollToBottomNextRender = false;
 
+    const reorderBlocksForOpencode = (blocks: ChatBlock[]): ChatBlock[] => {
+      const getSeq = (b: ChatBlock): number | null => {
+        const raw = (b as any)?.opencodeSeq;
+        if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+        return Math.trunc(raw);
+      };
+      const offsetFor = (b: ChatBlock): number => {
+        const explicit = (b as any)?.opencodeOffset;
+        if (typeof explicit === "number" && Number.isFinite(explicit))
+          return Math.trunc(explicit);
+        if (b.type === "reasoning") return 0;
+        if (b.type === "step") return 5;
+        if (b.type === "assistant") return 9;
+        return 9;
+      };
+      const scored = blocks.map((b, originalIndex) => ({
+        b,
+        originalIndex,
+        seq: getSeq(b),
+        offset: offsetFor(b),
+      }));
+      scored.sort((a, b) => {
+        // Only reorder blocks when both sides have a known OpenCode message sequence.
+        // This avoids reordering unrelated blocks (e.g. user messages) while still fixing
+        // the common issue where Step/Reasoning arrive after the final response.
+        if (a.seq === null || b.seq === null) {
+          return a.originalIndex - b.originalIndex;
+        }
+        if (a.seq !== b.seq) return a.seq - b.seq;
+        if (a.offset !== b.offset) return a.offset - b.offset;
+        return a.originalIndex - b.originalIndex;
+      });
+      return scored.map((x) => x.b);
+    };
+
+    const blocks = (() => {
+      const raw = s.blocks || [];
+      return s.activeSession?.backendId === "opencode"
+        ? reorderBlocksForOpencode(raw)
+        : raw;
+    })();
+
+    const cursorStart = (() => {
+      let cur: ChildNode | null = logEl.firstChild;
+      while (cur) {
+        const el = cur as HTMLElement;
+        const cls = typeof el.className === "string" ? el.className : "";
+        if (el.tagName.toLowerCase() === "details" && /\bnotice\b/.test(cls)) {
+          cur = cur.nextSibling;
+          continue;
+        }
+        break;
+      }
+      return cur;
+    })();
+    let cursor: ChildNode | null = cursorStart;
+    const placeTopLevel = (el: HTMLElement): void => {
+      // Reorder DOM to match the current blocks list.
+      // This keeps Turn numbering and visual order stable even when block updates
+      // arrive out of order.
+      if (el.parentElement !== logEl || el !== cursor) {
+        logEl.insertBefore(el, cursor);
+      }
+      cursor = el.nextSibling;
+    };
+
     let userTurnIndex = 0;
-    for (const block of s.blocks || []) {
+    for (const block of blocks) {
       if (block.type === "divider") {
         const key = "b:" + block.id;
         const dividerText = String(block.text ?? "");
@@ -4078,7 +4585,8 @@ function main(): void {
         const hasStatus = Boolean(block.status);
         if (!hasText && !hasStatus) {
           const existing = blockElByKey.get(key);
-          if (existing?.parentElement) existing.parentElement.removeChild(existing);
+          if (existing?.parentElement)
+            existing.parentElement.removeChild(existing);
           blockElByKey.delete(key);
           delete detailsState[key];
           continue;
@@ -4112,6 +4620,7 @@ function main(): void {
         }
         const pre = ensurePre(div, "body");
         if (pre.textContent !== dividerText) pre.textContent = dividerText;
+        placeTopLevel(div);
         continue;
       }
 
@@ -4120,6 +4629,7 @@ function main(): void {
         const div = ensureDiv(key, "note");
         const text = String(block.text ?? "");
         if (div.textContent !== text) div.textContent = text;
+        placeTopLevel(div);
         continue;
       }
 
@@ -4167,9 +4677,10 @@ function main(): void {
             return c;
           })();
         void ensureImageRendered(block, img, captionEl).catch((err) => {
-          captionEl.textContent = `画像の描画に失敗: ${String(err)}`;
+          captionEl.textContent = `Failed to render image: ${String(err)}`;
           captionEl.style.display = "";
         });
+        placeTopLevel(div);
         continue;
       }
 
@@ -4234,12 +4745,13 @@ function main(): void {
             })();
 
           void ensureImageRendered(imageRef, img, captionEl).catch((err) => {
-            captionEl.textContent = `画像の描画に失敗: ${String(err)}`;
+            captionEl.textContent = `Failed to render image: ${String(err)}`;
             captionEl.style.display = "";
           });
 
           gridEl.appendChild(tile);
         }
+        placeTopLevel(div);
         continue;
       }
 
@@ -4264,6 +4776,7 @@ function main(): void {
           })();
         const text = summaryQ ? `🔎 ${summaryQ}` : "🔎";
         if (row.textContent !== text) row.textContent = text;
+        placeTopLevel(div);
         continue;
       }
 
@@ -4276,7 +4789,10 @@ function main(): void {
 
         if (block.type === "user") {
           const backendId = state.activeSession?.backendId ?? null;
-          const canEdit = backendId === "codez" || backendId === "opencode";
+          const turnId =
+            typeof block.turnId === "string" ? block.turnId.trim() : "";
+          const canEdit =
+            (backendId === "codez" || backendId === "opencode") && Boolean(turnId);
           userTurnIndex += 1;
           div.dataset.turnIndex = String(userTurnIndex);
 
@@ -4331,11 +4847,11 @@ function main(): void {
             if (!canEdit) {
               showToast(
                 "info",
-                "Edit/Rewind は codez または opencode セッションのみ対応です。",
+                "Edit/Rewind is available after thread history is loaded.",
               );
               return;
             }
-            setEditMode(userTurnIndex, block.text);
+            setEditMode({ turnId, turnIndex: userTurnIndex }, block.text);
             inputEl.focus();
           });
           actions.appendChild(editBtn);
@@ -4377,13 +4893,113 @@ function main(): void {
             })();
           if (metaEl.textContent !== metaText) metaEl.textContent = metaText;
         }
+        placeTopLevel(div);
+        continue;
+      }
+
+      if (block.type === "opencodePermission") {
+        const id = "opencodePermission:" + block.id;
+        const title = `Permission required: ${String(block.permission ?? "").trim() || "permission"}`;
+        const open = block.status === "pending";
+        const det = ensureDetails(
+          id,
+          "tool opencodePermission",
+          open,
+          title,
+          id,
+        );
+        const status =
+          block.status === "pending"
+            ? "inProgress"
+            : block.status === "replied"
+              ? "completed"
+              : "failed";
+        setStatusIcon(det, status);
+
+        const meta = ensureMeta(det, "meta");
+        const metaParts: string[] = [];
+        if (Array.isArray(block.patterns) && block.patterns.length > 0) {
+          metaParts.push(`patterns=${block.patterns.join(", ")}`);
+        }
+        if (Array.isArray(block.always) && block.always.length > 0) {
+          metaParts.push(`always=${block.always.join(", ")}`);
+        }
+        if (block.reply) metaParts.push(`reply=${block.reply}`);
+        const metaText = metaParts.join(" ");
+        if (meta.textContent !== metaText) meta.textContent = metaText;
+
+        const bodyLines: string[] = [];
+        if (Array.isArray(block.patterns) && block.patterns.length > 0) {
+          bodyLines.push("patterns:");
+          for (const p of block.patterns) bodyLines.push(`- ${p}`);
+        }
+        if (Array.isArray(block.always) && block.always.length > 0) {
+          if (bodyLines.length > 0) bodyLines.push("");
+          bodyLines.push("always:");
+          for (const a of block.always) bodyLines.push(`- ${a}`);
+        }
+        if (block.metadata) {
+          if (bodyLines.length > 0) bodyLines.push("");
+          bodyLines.push("metadata:");
+          bodyLines.push(JSON.stringify(block.metadata, null, 2));
+        }
+        if (block.error) {
+          if (bodyLines.length > 0) bodyLines.push("");
+          bodyLines.push(`error: ${String(block.error)}`);
+        }
+        const pre = ensurePre(det, "body");
+        const bodyText = bodyLines.join("\n").trimEnd();
+        if (pre.textContent !== bodyText) pre.textContent = bodyText;
+
+        const actions =
+          (det.querySelector(
+            ':scope > div[data-k="actions"]',
+          ) as HTMLDivElement | null) ??
+          (() => {
+            const a = document.createElement("div");
+            a.dataset.k = "actions";
+            a.className = "approvalActions";
+            det.appendChild(a);
+            return a;
+          })();
+
+        actions.replaceChildren();
+        const disabled = block.status !== "pending";
+
+        const mk = (label: string, reply: "once" | "always" | "reject") => {
+          const btn = document.createElement("button");
+          btn.textContent = label;
+          btn.disabled = disabled;
+          btn.addEventListener("click", () => {
+            const sessionId = state.activeSession?.id ?? null;
+            if (!sessionId) return;
+            vscode.postMessage({
+              type: "opencodePermissionReply",
+              sessionId,
+              requestID: String(block.requestID),
+              reply,
+            });
+          });
+          return btn;
+        };
+
+        actions.appendChild(mk("Allow once", "once"));
+        actions.appendChild(mk("Always allow", "always"));
+        actions.appendChild(mk("Reject", "reject"));
+        placeTopLevel(det);
         continue;
       }
 
       if (block.type === "reasoning") {
-        const summary = (block.summaryParts || []).filter(Boolean).join("");
-        const raw = (block.rawParts || []).filter(Boolean).join("");
-        if (!summary && !raw) {
+        const summary = (block.summaryParts || [])
+          .map((s) => String(s ?? ""))
+          .filter((s) => s.trim().length > 0)
+          .join("");
+        const raw = (block.rawParts || [])
+          .map((s) => String(s ?? ""))
+          .filter((s) => s.trim().length > 0)
+          .join("");
+        if (!summary.trim() && !raw.trim()) {
           const id = "reasoning:" + block.id;
           for (const [k, el] of blockElByKey.entries()) {
             if (k !== id && !k.startsWith(id + ":")) continue;
@@ -4404,13 +5020,13 @@ function main(): void {
         );
         setStatusIcon(det, block.status);
 
-        if (summary) {
+        if (summary.trim()) {
           const pre = det.querySelector(`pre[data-k="summary"]`);
           if (pre) pre.remove();
           const mdEl = ensureMd(det, "summary");
           renderMarkdownInto(mdEl, summary);
         }
-        if (raw) {
+        if (raw.trim()) {
           const rawId = id + ":raw";
           const rawDet = ensureDetails(rawId, "", false, "Raw", rawId);
           // Ensure raw is nested under the reasoning details.
@@ -4418,6 +5034,7 @@ function main(): void {
           const pre = ensurePre(rawDet, "body");
           if (pre.textContent !== raw) pre.textContent = raw;
         }
+        placeTopLevel(det);
         continue;
       }
 
@@ -4604,6 +5221,36 @@ function main(): void {
         continue;
       }
 
+      if (block.type === "collab") {
+        const id = "collab:" + block.id;
+        const summaryText =
+          block.title ||
+          (block.tool ? `Sub-agent: ${block.tool}` : "Sub-agent");
+        const det = ensureDetails(
+          id,
+          "tool collab",
+          block.status === "inProgress",
+          summaryText,
+          id,
+        );
+        const meta = ensureMeta(det, "meta");
+        const receivers =
+          Array.isArray(block.receiverThreadIds) &&
+          block.receiverThreadIds.length > 0
+            ? block.receiverThreadIds.join(", ")
+            : "";
+        const metaParts = [block.tool, block.senderThreadId, receivers].filter(
+          (p) => String(p || "").trim().length > 0,
+        );
+        const metaText = metaParts.join(" • ");
+        if (meta.textContent !== metaText) meta.textContent = metaText;
+        setStatusIcon(det, block.status);
+        const pre = ensurePre(det, "body");
+        const text = block.detail || "";
+        if (pre.textContent !== text) pre.textContent = text;
+        continue;
+      }
+
       if (block.type === "step") {
         const id = "step:" + block.id;
         const tools = Array.isArray(block.tools) ? block.tools : [];
@@ -4632,8 +5279,10 @@ function main(): void {
 
         const meta = ensureMeta(det, "meta");
         const metaParts: string[] = [];
-        if (block.snapshot) metaParts.push("snapshot=" + block.snapshot.slice(0, 8));
-        if (typeof block.cost === "number") metaParts.push("cost=" + String(block.cost));
+        if (block.snapshot)
+          metaParts.push("snapshot=" + block.snapshot.slice(0, 8));
+        if (typeof block.cost === "number")
+          metaParts.push("cost=" + String(block.cost));
         if (block.tokens) {
           if (typeof block.tokens.input === "number")
             metaParts.push("in=" + String(block.tokens.input));
@@ -4668,7 +5317,9 @@ function main(): void {
               ? String((t as any).inputPreview || "").trim()
               : "";
           const suffix = inputPreview ? truncateOneLine(inputPreview, 80) : "";
-          const toolSummary = suffix ? `${t.tool}: ${t.title} — ${suffix}` : `${t.tool}: ${t.title}`;
+          const toolSummary = suffix
+            ? `${t.tool}: ${t.title} — ${suffix}`
+            : `${t.tool}: ${t.title}`;
           const toolDet = ensureNestedDetailsWithStatusIcon(
             det,
             toolId,
@@ -4691,6 +5342,7 @@ function main(): void {
           delete detailsState[k];
         }
 
+        placeTopLevel(det);
         continue;
       }
 
@@ -4707,6 +5359,41 @@ function main(): void {
         if (pre) pre.remove();
         const mdEl = ensureMd(det, "body");
         renderMarkdownInto(mdEl, block.text);
+        placeTopLevel(det);
+        continue;
+      }
+
+      if (block.type === "actionCard") {
+        const key = "b:" + block.id;
+        const div = ensureDiv(key, "msg actionCard");
+        div.replaceChildren();
+        const header = el("div", "actionCardHeader");
+        header.textContent = block.title;
+        const body = el("div", "actionCardBody");
+        renderMarkdownInto(body, block.text);
+        const actions = el("div", "actionCardActions");
+        for (const action of block.actions) {
+          const btn = document.createElement("button");
+          btn.className =
+            action.style === "primary"
+              ? "actionCardBtn primary"
+              : "actionCardBtn";
+          btn.textContent = action.label;
+          btn.addEventListener("click", () => {
+            if (!state.activeSession) return;
+            vscode.postMessage({
+              type: "actionCardAction",
+              sessionId: state.activeSession.id,
+              cardId: block.id,
+              actionId: action.id,
+            });
+          });
+          actions.appendChild(btn);
+        }
+        div.appendChild(header);
+        div.appendChild(body);
+        if (block.actions.length > 0) div.appendChild(actions);
+        placeTopLevel(div);
         continue;
       }
 
@@ -4725,6 +5412,7 @@ function main(): void {
           if (pre) pre.remove();
           const mdEl = ensureMd(det, "body");
           renderMarkdownInto(mdEl, block.text);
+          placeTopLevel(det);
           continue;
         }
 
@@ -4741,6 +5429,7 @@ function main(): void {
           if (pre) pre.remove();
           const mdEl = ensureMd(det, "body");
           renderMarkdownInto(mdEl, block.text);
+          placeTopLevel(det);
           continue;
         }
 
@@ -4749,6 +5438,7 @@ function main(): void {
         if (pre) pre.remove();
         const mdEl = ensureMd(div, "body");
         renderMarkdownInto(mdEl, block.text);
+        placeTopLevel(div);
         continue;
       }
 
@@ -4759,6 +5449,7 @@ function main(): void {
         if (pre) pre.remove();
         const mdEl = ensureMd(div, "body");
         renderMarkdownInto(mdEl, block.text);
+        placeTopLevel(div);
         continue;
       }
 
@@ -4775,6 +5466,7 @@ function main(): void {
         if (pre) pre.remove();
         const mdEl = ensureMd(det, "body");
         renderMarkdownInto(mdEl, block.text);
+        placeTopLevel(det);
         continue;
       }
 
@@ -4792,17 +5484,20 @@ function main(): void {
     }
   }
 
-  function setEditMode(next: number | null, presetText?: string): void {
+  function setEditMode(
+    next: { turnId: string; turnIndex: number } | null,
+    presetText?: string,
+  ): void {
     const backendId = state.activeSession?.backendId ?? null;
     const canEdit = backendId === "codez" || backendId === "opencode";
     if (next !== null && !canEdit) {
       showToast(
         "info",
-        "Edit/Rewind は codez または opencode セッションのみ対応です。",
+        "Edit/Rewind is supported for codez/opencode sessions only.",
       );
       return;
     }
-    rewindTurnIndex = next;
+    rewindTarget = next;
 
     if (typeof presetText === "string") {
       inputEl.value = presetText;
@@ -4811,7 +5506,7 @@ function main(): void {
       saveComposerState();
     }
 
-    if (rewindTurnIndex === null) {
+    if (rewindTarget === null) {
       editBannerEl.style.display = "none";
       editBannerEl.replaceChildren();
       return;
@@ -4820,7 +5515,7 @@ function main(): void {
     editBannerEl.replaceChildren();
     const text = document.createElement("div");
     text.className = "editBannerText";
-    text.textContent = `Editing turn #${rewindTurnIndex}. Sending will rewind and replace subsequent messages.`;
+    text.textContent = `Editing turn #${rewindTarget.turnIndex}. Sending will rewind and replace subsequent messages.`;
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
     cancel.addEventListener("click", () => setEditMode(null));
@@ -4829,34 +5524,39 @@ function main(): void {
     editBannerEl.style.display = "";
   }
 
-  function sendCurrentInput(): void {
+  function dispatchCurrentInput(mode: "send" | "queue"): void {
     if (!state.activeSession) return;
-    if (state.sending) return;
     const backendId = state.activeSession.backendId;
     const canEdit = backendId === "codez" || backendId === "opencode";
     const text = inputEl.value;
     const trimmed = text.trim();
     if (!trimmed && pendingImages.length === 0) return;
+    const sendType =
+      mode === "queue"
+        ? pendingImages.length > 0
+          ? "queueSendWithImages"
+          : "queueSend"
+        : pendingImages.length > 0
+          ? "sendWithImages"
+          : "send";
     if (pendingImages.length > 0) {
+      if (!allowsImageInputs(state)) {
+        showToast("info", "The selected model does not support image inputs.");
+        return;
+      }
       vscode.postMessage({
-        type: "sendWithImages",
+        type: sendType,
         text,
         images: pendingImages.map((img) => ({ name: img.name, url: img.url })),
-        rewind:
-          canEdit && rewindTurnIndex !== null
-            ? { turnIndex: rewindTurnIndex }
-            : null,
+        rewind: canEdit && rewindTarget !== null ? rewindTarget : null,
       });
       pendingImages.splice(0, pendingImages.length);
       renderAttachments();
     } else {
       vscode.postMessage({
-        type: "send",
+        type: sendType,
         text,
-        rewind:
-          canEdit && rewindTurnIndex !== null
-            ? { turnIndex: rewindTurnIndex }
-            : null,
+        rewind: canEdit && rewindTarget !== null ? rewindTarget : null,
       });
     }
 
@@ -4873,6 +5573,35 @@ function main(): void {
     updateSuggestions();
     saveComposerState();
     setEditMode(null);
+  }
+
+  function sendCurrentInput(): void {
+    dispatchCurrentInput("send");
+  }
+
+  function queueCurrentInput(): void {
+    dispatchCurrentInput("queue");
+  }
+
+  function allowsImageInputs(s: ChatViewState): boolean {
+    const models = s.models ?? [];
+    if (models.length === 0) return true;
+    const selected = String(s.modelState?.model ?? "").trim();
+    const selectedKey = selected && selected !== "default" ? selected : "";
+    const opencodeDefaultKey =
+      s.activeSession?.backendId === "opencode"
+        ? String(s.opencodeDefaultModelKey || "")
+        : "";
+    const model =
+      models.find((m) => String(m.model || m.id) === selectedKey) ??
+      (opencodeDefaultKey
+        ? models.find((m) => String(m.model || m.id) === opencodeDefaultKey)
+        : null) ??
+      models.find((m) => Boolean(m.isDefault)) ??
+      null;
+    const modalities = model?.inputModalities ?? null;
+    if (!modalities || modalities.length === 0) return true;
+    return modalities.map((m) => String(m).toLowerCase()).includes("image");
   }
 
   function renderAttachments(): void {
@@ -4966,6 +5695,8 @@ function main(): void {
   document.addEventListener(
     "keydown",
     (e) => {
+      if (handleCollaborationModeToggleShortcut(e as KeyboardEvent, "global"))
+        return;
       const ke = e as KeyboardEvent;
       if (ke.key !== "Escape") return;
       if (!state.sending) return;
@@ -4977,7 +5708,13 @@ function main(): void {
     true,
   );
 
-  attachBtn.addEventListener("click", () => imageInput.click());
+    attachBtn.addEventListener("click", () => {
+      if (!allowsImageInputs(state)) {
+      showToast("info", "The selected model does not support image inputs.");
+      return;
+    }
+    imageInput.click();
+  });
   imageInput.addEventListener("change", async () => {
     const files = Array.from(imageInput.files ?? []);
     imageInput.value = "";
@@ -5011,7 +5748,7 @@ function main(): void {
       : (() => {
           const backendId = state.activeSession?.backendId ?? null;
           if (backendId !== "codez") {
-            showToast("info", "Reload は codez セッションのみ対応です。");
+            showToast("info", "Reload is supported for codez sessions only.");
             return;
           }
           vscode.postMessage({ type: "reloadSession" });
@@ -5057,6 +5794,10 @@ function main(): void {
           it.kind === "file" && String(it.type || "").startsWith("image/"),
       );
       if (imageItems.length === 0) return;
+      if (!allowsImageInputs(state)) {
+        showToast("info", "The selected model does not support image inputs.");
+        return;
+      }
       if (!state.activeSession) return;
 
       for (let i = 0; i < imageItems.length; i++) {
@@ -5098,6 +5839,20 @@ function main(): void {
   });
 
   inputEl.addEventListener("keydown", (e) => {
+    if (handleCollaborationModeToggleShortcut(e as KeyboardEvent, "input"))
+      return;
+    if (
+      (e as KeyboardEvent).key === "Tab" &&
+      !(e as KeyboardEvent).shiftKey &&
+      !(e as KeyboardEvent).altKey &&
+      !(e as KeyboardEvent).metaKey &&
+      !(e as KeyboardEvent).ctrlKey &&
+      state.sending
+    ) {
+      e.preventDefault();
+      queueCurrentInput();
+      return;
+    }
     if (
       (e as KeyboardEvent).key === "Enter" &&
       !(e as KeyboardEvent).shiftKey
@@ -5385,24 +6140,30 @@ function main(): void {
       scheduleBlocksRender();
       return;
     }
-    if (anyMsg.type === "askUserQuestionStart") {
+    if (anyMsg.type === "requestUserInputStart") {
       const requestKey =
         typeof (anyMsg as any).requestKey === "string"
           ? (anyMsg as any).requestKey
           : null;
       if (!requestKey) return;
-      const request = (anyMsg as any).request as AskUserQuestionRequest;
-      if (!request || typeof request !== "object") return;
+      const sessionId =
+        typeof (anyMsg as any).sessionId === "string"
+          ? (anyMsg as any).sessionId
+          : null;
+      if (!sessionId) return;
+      const params = (anyMsg as any).params;
+      const questions = Array.isArray(params?.questions)
+        ? (params.questions as RequestUserInputQuestion[])
+        : [];
+      if (questions.length === 0) return;
 
-      askUserQuestionState = {
+      enqueueRequestUserInput({
+        sessionId,
         requestKey,
-        request,
-        index: 0,
-        answers: {},
-        otherTextById: {},
-      };
-      askUserQuestionError = null;
-      renderAskUserQuestion();
+        questions,
+        params,
+      });
+      maybeStartRequestUserInputForActiveSession();
       return;
     }
     if (anyMsg.type === "blockUpsert") {
@@ -5584,7 +6345,19 @@ function main(): void {
 
       skillIndex = skills;
       skillIndexForSessionId = sessionId;
+      skillIndexRequestedForSessionId = null;
       updateSuggestions();
+      return;
+    }
+    if (anyMsg.type === "skillIndexInvalidate") {
+      const sessionId =
+        typeof anyMsg.sessionId === "string" ? anyMsg.sessionId : null;
+      if (!sessionId) return;
+      if (skillIndexForSessionId === sessionId) {
+        skillIndex = null;
+        skillIndexForSessionId = null;
+        skillIndexRequestedForSessionId = null;
+      }
       return;
     }
     if (anyMsg.type === "insertText") {
