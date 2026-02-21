@@ -16,6 +16,7 @@ import type { TurnStartParams } from "../generated/v2/TurnStartParams";
 import type { TurnStartResponse } from "../generated/v2/TurnStartResponse";
 import type { TurnInterruptParams } from "../generated/v2/TurnInterruptParams";
 import type { TurnInterruptResponse } from "../generated/v2/TurnInterruptResponse";
+import type { UserInput } from "../generated/v2/UserInput";
 import type { SkillsListParams } from "../generated/v2/SkillsListParams";
 import type { SkillsListResponse } from "../generated/v2/SkillsListResponse";
 import type { SkillsRemoteReadParams } from "../generated/v2/SkillsRemoteReadParams";
@@ -64,6 +65,16 @@ import type { ReviewDecision } from "../generated/ReviewDecision";
 import { RpcClient } from "./rpc";
 import type { AnyServerNotification } from "./types";
 import { promptRequestUserInput } from "./request_user_input";
+
+type TurnSteerParams = {
+  threadId: string;
+  input: UserInput[];
+  expectedTurnId: string;
+};
+
+type TurnSteerResponse = {
+  turnId: string;
+};
 
 type SpawnOptions = {
   command: string;
@@ -279,6 +290,15 @@ export class BackendProcess implements vscode.Disposable {
       method: "turn/start",
       params,
     });
+  }
+
+  public async turnSteer(params: TurnSteerParams): Promise<TurnSteerResponse> {
+    return this.rpc.request<TurnSteerResponse>(
+      {
+        method: "turn/steer",
+        params,
+      } as any,
+    );
   }
 
   public async turnInterrupt(

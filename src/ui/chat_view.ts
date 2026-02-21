@@ -14,6 +14,7 @@ export type ChatBlock =
       id: string;
       type: "assistant";
       text: string;
+      turnId?: string;
       streaming?: boolean;
       meta?: string | null;
     }
@@ -68,13 +69,20 @@ export type ChatBlock =
       role: "user" | "assistant" | "tool" | "system";
     }
   | { id: string; type: "info"; title: string; text: string }
-  | { id: string; type: "webSearch"; query: string; status: string }
+  | {
+      id: string;
+      type: "webSearch";
+      query: string;
+      status: string;
+      turnId?: string;
+    }
   | {
       id: string;
       type: "reasoning";
       summaryParts: string[];
       rawParts: string[];
       status: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -89,6 +97,7 @@ export type ChatBlock =
       durationMs: number | null;
       terminalStdin: string[];
       output: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -99,6 +108,7 @@ export type ChatBlock =
       detail: string;
       hasDiff: boolean;
       diffs?: Array<{ path: string; diff: string }>;
+      turnId?: string;
     }
   | {
       id: string;
@@ -108,6 +118,7 @@ export type ChatBlock =
       server: string;
       tool: string;
       detail: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -118,6 +129,7 @@ export type ChatBlock =
       senderThreadId: string;
       receiverThreadIds: string[];
       detail: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -141,6 +153,7 @@ export type ChatBlock =
         inputPreview?: string | null;
         detail: string;
       }>;
+      turnId?: string;
     }
   | { id: string; type: "plan"; title: string; text: string }
   | { id: string; type: "error"; title: string; text: string }
@@ -382,6 +395,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       images?: Array<{ name: string; url: string }>,
       rewind?: RewindRequest | null,
     ) => Promise<void>,
+    private readonly onSteer: (
+      text: string,
+      rewind?: RewindRequest | null,
+    ) => Promise<void>,
     private readonly onOpencodePermissionReply: (
       session: Session,
       args: { requestID: string; reply: "once" | "always" | "reject" },
@@ -490,8 +507,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const st = this.getState();
     const active = st.activeSession;
     if (!active || active.id !== sessionId) return;
+    const insertBeforeRaw = (block as any).__insertBeforeBlockId;
+    const insertBeforeBlockId =
+      typeof insertBeforeRaw === "string" && insertBeforeRaw.trim().length > 0
+        ? insertBeforeRaw.trim()
+        : undefined;
+    if (insertBeforeBlockId) delete (block as any).__insertBeforeBlockId;
     void this.view.webview
-      .postMessage({ type: "blockUpsert", sessionId, block })
+      .postMessage({
+        type: "blockUpsert",
+        sessionId,
+        block,
+        insertBeforeBlockId,
+      })
       .then(undefined, (err) => {
         this.onUiError(
           `Failed to post block update to webview: ${String(err)}`,
@@ -704,6 +732,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           url: (img as any).url as string,
         }));
       await this.onQueueSend(text, normalized, (rewind as any) ?? null);
+      return;
+    }
+
+    if (type === "steer") {
+      const text = anyMsg["text"];
+      const rewind = anyMsg["rewind"];
+      const requestId = anyMsg["requestId"];
+      if (typeof text !== "string") return;
+      if (typeof requestId !== "string" || !requestId) return;
+      try {
+        await this.onSteer(text, (rewind as any) ?? null);
+        void this.view?.webview.postMessage({
+          type: "steerResult",
+          requestId,
+          ok: true,
+        });
+      } catch (err) {
+        const error =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : JSON.stringify(err);
+        void this.view?.webview.postMessage({
+          type: "steerResult",
+          requestId,
+          ok: false,
+          error,
+        });
+      }
       return;
     }
 
@@ -1870,6 +1928,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       button.iconBtn.attachBtn::before { content: "📎"; font-size: 14px; }
       .requestUserInput { padding: 10px 12px; border-top: 1px solid rgba(127,127,127,0.25); border-bottom: 1px solid rgba(127,127,127,0.25); display: none; }
       .attachments { display: none; flex-wrap: wrap; gap: 8px; }
+      .runtimeActionRow { display: none; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .runtimeActionHint { font-size: 12px; opacity: 0.75; }
+      .runtimeActionBtn { padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+      .runtimeActionBtn.primary { background: rgba(0, 120, 212, 0.18); border-color: rgba(0,120,212,0.45); }
       .attachmentChip { border: 1px solid rgba(127,127,127,0.35); border-radius: 10px; padding: 6px 8px; font-size: 12px; display: inline-flex; gap: 8px; align-items: center; max-width: 320px; }
       .attachmentThumb { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(127,127,127,0.25); background: rgba(0,0,0,0.02); flex: 0 0 auto; }
       .attachmentName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.9; }
@@ -1968,10 +2030,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
 	    <div id="log" class="log"></div>
       <div id="hydrateBanner" class="hydrateBanner" style="display:none"></div>
-		    <div id="composer" class="composer">
+	    <div id="composer" class="composer">
 	      <div id="editBanner" class="editBanner" style="display:none"></div>
 	      <div id="requestUserInput" class="requestUserInput"></div>
 	      <div id="attachments" class="attachments"></div>
+        <div id="runtimeActionRow" class="runtimeActionRow">
+          <div class="runtimeActionHint">Turn running</div>
+          <button id="steerSend" class="runtimeActionBtn primary" title="Send to current running turn">Steer send</button>
+          <button id="queueSend" class="runtimeActionBtn" title="Queue for next turn">Queue next</button>
+        </div>
 	      <button id="returnToBottom" class="returnToBottomBtn" title="Scroll to bottom">Return to Bottom</button>
 	      <div id="inputRow" class="inputRow">
         <input id="imageInput" type="file" accept="image/*" multiple style="display:none" />

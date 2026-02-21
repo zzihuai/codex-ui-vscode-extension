@@ -1458,6 +1458,88 @@ export class BackendManager implements vscode.Disposable {
     await this.sendMessageWithModelAndImages(session, text, [], modelSettings);
   }
 
+  public async steerMessage(
+    session: Session,
+    text: string,
+    expectedTurnId: string,
+    extraInput: UserInput[] = [],
+  ): Promise<void> {
+    await this.steerMessageWithImages(
+      session,
+      text,
+      [],
+      expectedTurnId,
+      extraInput,
+    );
+  }
+
+  public async steerMessageWithImages(
+    session: Session,
+    text: string,
+    images: Array<
+      { kind: "imageUrl"; url: string } | { kind: "localImage"; path: string }
+    >,
+    expectedTurnId: string,
+    extraInput: UserInput[] = [],
+  ): Promise<void> {
+    const folder = this.resolveWorkspaceFolder(session.workspaceFolderUri);
+    if (!folder) {
+      throw new Error(
+        `WorkspaceFolder not found for session: ${session.workspaceFolderUri}`,
+      );
+    }
+
+    await this.startForBackendId(folder, session.backendId);
+
+    const oc = this.opencode.get(session.backendKey);
+    if (oc) {
+      throw new Error("Steer is not supported for opencode sessions.");
+    }
+
+    const proc = this.processes.get(session.backendKey);
+    if (!proc)
+      throw new Error("Backend is not running for this workspace folder");
+
+    const input: UserInput[] = [];
+    if (text.trim()) input.push({ type: "text", text, text_elements: [] });
+    input.push(...extraInput);
+    for (const img of images) {
+      if (!img) continue;
+      if (img.kind === "imageUrl") {
+        const url = img.url;
+        if (typeof url !== "string" || url.trim() === "") continue;
+        input.push({ type: "image", url });
+        continue;
+      }
+      if (img.kind === "localImage") {
+        const p = img.path;
+        if (typeof p !== "string" || p.trim() === "") continue;
+        input.push({ type: "localImage", path: p });
+        continue;
+      }
+      const neverImg: never = img;
+      throw new Error(`Unexpected image input: ${String(neverImg)}`);
+    }
+    if (input.length === 0) {
+      throw new Error("Steer input must include text, mentions, or images");
+    }
+
+    const turnId = expectedTurnId.trim();
+    if (!turnId) {
+      throw new Error("Steer requires a non-empty expected turn id");
+    }
+    const steer = await this.withTimeout(
+      "turn/steer",
+      proc.turnSteer({
+        threadId: session.threadId,
+        input,
+        expectedTurnId: turnId,
+      }),
+      10_000,
+    );
+    this.streamState.set(session.threadId, { activeTurnId: steer.turnId });
+  }
+
   public async sendMessageWithModelAndImages(
     session: Session,
     text: string,
@@ -3962,6 +4044,17 @@ function summarizeItem(
       const it = item as any;
       const status = phase === "completed" ? ` status=${it.status}` : "";
       return `${prefix}${status}\n${it.server}.${it.tool}\n`;
+    }
+    case "collabAgentToolCall": {
+      const it = item as any;
+      const status = phase === "completed" ? ` status=${it.status}` : "";
+      const sender =
+        typeof it.senderThreadId === "string" ? String(it.senderThreadId) : "";
+      const receivers = Array.isArray(it.receiverThreadIds)
+        ? it.receiverThreadIds.map((id: unknown) => String(id)).join(", ")
+        : "";
+      const target = receivers || sender || "(none)";
+      return `${prefix}${status}\n${String(it.tool ?? "")} -> ${target}\n`;
     }
     case "webSearch": {
       const it = item as any;

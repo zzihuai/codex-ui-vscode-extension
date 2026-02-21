@@ -36,6 +36,7 @@ type ChatBlock =
       id: string;
       type: "assistant";
       text: string;
+      turnId?: string;
       streaming?: boolean;
       meta?: string | null;
     }
@@ -90,13 +91,20 @@ type ChatBlock =
       role: "user" | "assistant" | "tool" | "system";
     }
   | { id: string; type: "info"; title: string; text: string }
-  | { id: string; type: "webSearch"; query: string; status: string }
+  | {
+      id: string;
+      type: "webSearch";
+      query: string;
+      status: string;
+      turnId?: string;
+    }
   | {
       id: string;
       type: "reasoning";
       summaryParts: string[];
       rawParts: string[];
       status: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -111,6 +119,7 @@ type ChatBlock =
       durationMs: number | null;
       terminalStdin: string[];
       output: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -121,6 +130,7 @@ type ChatBlock =
       detail: string;
       hasDiff: boolean;
       diffs?: Array<{ path: string; diff: string }>;
+      turnId?: string;
     }
   | {
       id: string;
@@ -130,6 +140,7 @@ type ChatBlock =
       server: string;
       tool: string;
       detail: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -140,6 +151,7 @@ type ChatBlock =
       senderThreadId: string;
       receiverThreadIds: string[];
       detail: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -163,6 +175,7 @@ type ChatBlock =
         inputPreview?: string | null;
         detail: string;
       }>;
+      turnId?: string;
     }
   | { id: string; type: "plan"; title: string; text: string }
   | { id: string; type: "error"; title: string; text: string }
@@ -315,6 +328,9 @@ function main(): void {
   const imageInput = mustGet<HTMLInputElement>("imageInput");
   const attachBtn = mustGet<HTMLButtonElement>("attach");
   const attachmentsEl = mustGet("attachments");
+  const runtimeActionRowEl = mustGet("runtimeActionRow");
+  const steerSendBtn = mustGet<HTMLButtonElement>("steerSend");
+  const queueSendBtn = mustGet<HTMLButtonElement>("queueSend");
   const returnToBottomBtn = mustGet<HTMLButtonElement>("returnToBottom");
   const sendBtn = mustGet<HTMLButtonElement>("send");
   const newBtn = mustGet<HTMLButtonElement>("new");
@@ -436,6 +452,8 @@ function main(): void {
     imageInput.disabled = disabled;
     attachBtn.disabled = disabled;
     sendBtn.disabled = disabled;
+    steerSendBtn.disabled = disabled;
+    queueSendBtn.disabled = disabled;
   };
 
   const postRequestUserInputResponse = (cancelled: boolean): void => {
@@ -1004,6 +1022,8 @@ function main(): void {
   };
 
   const inputHistoryBySessionKey = new Map<string, InputHistoryState>();
+  const pendingSteerRequestIds = new Set<string>();
+  const pendingSteerTextByRequestId = new Map<string, string>();
 
   const ensureInputHistoryState = (key: string): InputHistoryState => {
     const existing = inputHistoryBySessionKey.get(key);
@@ -3964,10 +3984,20 @@ function main(): void {
       statusPopoverEnabled = false;
     }
     if (diffBtn) diffBtn.disabled = !s.hasLatestDiff;
+    const canSteer =
+      Boolean(s.activeSession) &&
+      s.sending &&
+      (backendId === "codez" || backendId === "codex");
     sendBtn.disabled = !s.activeSession;
     sendBtn.dataset.mode = s.sending ? "stop" : "send";
     sendBtn.setAttribute("aria-label", s.sending ? "Stop" : "Send");
     sendBtn.title = s.sending ? "Stop (Esc)" : "Send (Enter)";
+    runtimeActionRowEl.style.display = s.sending ? "flex" : "none";
+    steerSendBtn.disabled = !canSteer;
+    steerSendBtn.title = canSteer
+      ? "Send to the current running turn"
+      : "Steer is available for codez/codex running turns only";
+    queueSendBtn.disabled = !s.activeSession || !s.sending;
     if (statusBtn) statusBtn.disabled = !s.activeSession || s.sending;
     resumeBtn.disabled = s.sending;
     attachBtn.disabled = !s.activeSession || !allowsImageInputs(s);
@@ -4520,6 +4550,11 @@ function main(): void {
         const explicit = (b as any)?.opencodeOffset;
         if (typeof explicit === "number" && Number.isFinite(explicit))
           return Math.trunc(explicit);
+        if (b.type === "command") return 4;
+        if (b.type === "fileChange") return 4;
+        if (b.type === "webSearch") return 4;
+        if (b.type === "mcp") return 6;
+        if (b.type === "collab") return 6;
         if (b.type === "reasoning") return 0;
         if (b.type === "step") return 5;
         if (b.type === "assistant") return 9;
@@ -4577,6 +4612,7 @@ function main(): void {
     };
 
     let userTurnIndex = 0;
+    let lastUserTurnId: string | null = null;
     for (const block of blocks) {
       if (block.type === "divider") {
         const key = "b:" + block.id;
@@ -4793,7 +4829,13 @@ function main(): void {
             typeof block.turnId === "string" ? block.turnId.trim() : "";
           const canEdit =
             (backendId === "codez" || backendId === "opencode") && Boolean(turnId);
-          userTurnIndex += 1;
+          const isSteerInSameTurn = Boolean(turnId) && turnId === lastUserTurnId;
+          if (isSteerInSameTurn) {
+            // keep current index
+          } else {
+            userTurnIndex += 1;
+            lastUserTurnId = turnId || null;
+          }
           div.dataset.turnIndex = String(userTurnIndex);
 
           const header =
@@ -4819,7 +4861,9 @@ function main(): void {
               header.appendChild(t);
               return t;
             })();
-          title.textContent = `Turn #${userTurnIndex}`;
+          title.textContent = isSteerInSameTurn
+            ? `Turn #${userTurnIndex} steer`
+            : `Turn #${userTurnIndex}`;
 
           const actions =
             (header.querySelector(
@@ -5131,6 +5175,7 @@ function main(): void {
           if (metaText.length <= MAX_LINKIFY_TEXT_CHARS) linkifyFilePaths(meta);
         }
         det.appendChild(meta);
+        placeTopLevel(det);
         continue;
       }
 
@@ -5198,6 +5243,7 @@ function main(): void {
           blockElByKey.delete(k);
           delete detailsState[k];
         }
+        placeTopLevel(det);
         continue;
       }
 
@@ -5218,6 +5264,7 @@ function main(): void {
         const pre = ensurePre(det, "body");
         const text = block.detail || "";
         if (pre.textContent !== text) pre.textContent = text;
+        placeTopLevel(det);
         continue;
       }
 
@@ -5248,6 +5295,7 @@ function main(): void {
         const pre = ensurePre(det, "body");
         const text = block.detail || "";
         if (pre.textContent !== text) pre.textContent = text;
+        placeTopLevel(det);
         continue;
       }
 
@@ -5524,21 +5572,68 @@ function main(): void {
     editBannerEl.style.display = "";
   }
 
-  function dispatchCurrentInput(mode: "send" | "queue"): void {
+  const recordSentInputToHistory = (trimmed: string): void => {
+    const hist = ensureInputHistoryState(activeComposerKey);
+    const last = hist.items.at(-1);
+    if (last !== trimmed) hist.items.push(trimmed);
+    hist.index = null;
+    hist.draftBeforeHistory = "";
+  };
+
+  const clearComposerInput = (): void => {
+    inputEl.value = "";
+    inputEl.setSelectionRange(0, 0);
+    autosizeInput();
+    updateSuggestions();
+    saveComposerState();
+  };
+
+  function dispatchCurrentInput(mode: "send" | "queue" | "steer"): void {
     if (!state.activeSession) return;
     const backendId = state.activeSession.backendId;
     const canEdit = backendId === "codez" || backendId === "opencode";
     const text = inputEl.value;
     const trimmed = text.trim();
     if (!trimmed && pendingImages.length === 0) return;
+    if (mode === "steer" && pendingImages.length > 0) {
+      showToast(
+        "info",
+        "Steer send does not support image input. Use Queue next or wait until the turn completes.",
+      );
+      return;
+    }
     const sendType =
       mode === "queue"
         ? pendingImages.length > 0
           ? "queueSendWithImages"
           : "queueSend"
+        : mode === "steer"
+          ? "steer"
         : pendingImages.length > 0
           ? "sendWithImages"
           : "send";
+    const rewindPayload =
+      mode === "steer"
+        ? null
+        : canEdit && rewindTarget !== null
+          ? rewindTarget
+          : null;
+    if (mode === "steer") {
+      if (pendingSteerRequestIds.size > 0) {
+        showToast("info", "Steer request is in progress.");
+        return;
+      }
+      const requestId = `steer:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+      pendingSteerRequestIds.add(requestId);
+      pendingSteerTextByRequestId.set(requestId, text);
+      vscode.postMessage({
+        type: sendType,
+        text,
+        rewind: rewindPayload,
+        requestId,
+      });
+      return;
+    }
     if (pendingImages.length > 0) {
       if (!allowsImageInputs(state)) {
         showToast("info", "The selected model does not support image inputs.");
@@ -5548,7 +5643,7 @@ function main(): void {
         type: sendType,
         text,
         images: pendingImages.map((img) => ({ name: img.name, url: img.url })),
-        rewind: canEdit && rewindTarget !== null ? rewindTarget : null,
+        rewind: rewindPayload,
       });
       pendingImages.splice(0, pendingImages.length);
       renderAttachments();
@@ -5556,22 +5651,12 @@ function main(): void {
       vscode.postMessage({
         type: sendType,
         text,
-        rewind: canEdit && rewindTarget !== null ? rewindTarget : null,
+        rewind: rewindPayload,
       });
     }
 
-    // Keep a simple history for navigating with Up/Down.
-    const hist = ensureInputHistoryState(activeComposerKey);
-    const last = hist.items.at(-1);
-    if (last !== trimmed) hist.items.push(trimmed);
-    hist.index = null;
-    hist.draftBeforeHistory = "";
-
-    inputEl.value = "";
-    inputEl.setSelectionRange(0, 0);
-    autosizeInput();
-    updateSuggestions();
-    saveComposerState();
+    recordSentInputToHistory(trimmed);
+    clearComposerInput();
     setEditMode(null);
   }
 
@@ -5581,6 +5666,10 @@ function main(): void {
 
   function queueCurrentInput(): void {
     dispatchCurrentInput("queue");
+  }
+
+  function steerCurrentInput(): void {
+    dispatchCurrentInput("steer");
   }
 
   function allowsImageInputs(s: ChatViewState): boolean {
@@ -5689,6 +5778,8 @@ function main(): void {
   sendBtn.addEventListener("click", () =>
     state.sending ? stopCurrentTurn() : sendCurrentInput(),
   );
+  steerSendBtn.addEventListener("click", () => steerCurrentInput());
+  queueSendBtn.addEventListener("click", () => queueCurrentInput());
 
   // Only stop from Esc when the input itself is focused.
   // (Do not bind a global Esc handler; that would conflict with VS Code keybindings.)
@@ -5842,18 +5933,6 @@ function main(): void {
     if (handleCollaborationModeToggleShortcut(e as KeyboardEvent, "input"))
       return;
     if (
-      (e as KeyboardEvent).key === "Tab" &&
-      !(e as KeyboardEvent).shiftKey &&
-      !(e as KeyboardEvent).altKey &&
-      !(e as KeyboardEvent).metaKey &&
-      !(e as KeyboardEvent).ctrlKey &&
-      state.sending
-    ) {
-      e.preventDefault();
-      queueCurrentInput();
-      return;
-    }
-    if (
       (e as KeyboardEvent).key === "Enter" &&
       !(e as KeyboardEvent).shiftKey
     ) {
@@ -5864,7 +5943,11 @@ function main(): void {
         return;
       }
       e.preventDefault();
-      sendCurrentInput();
+      if (state.sending) {
+        steerCurrentInput();
+      } else {
+        sendCurrentInput();
+      }
       return;
     }
     if ((e as KeyboardEvent).key === "Escape" && state.sending) {
@@ -6074,6 +6157,28 @@ function main(): void {
       scheduleRender();
       return;
     }
+    if (anyMsg.type === "steerResult") {
+      const requestId =
+        typeof anyMsg.requestId === "string" ? anyMsg.requestId : null;
+      if (!requestId) return;
+      if (!pendingSteerRequestIds.has(requestId)) return;
+      pendingSteerRequestIds.delete(requestId);
+      const sentText = pendingSteerTextByRequestId.get(requestId) ?? "";
+      pendingSteerTextByRequestId.delete(requestId);
+      if (anyMsg.ok) {
+        const sentTrimmed = sentText.trim();
+        if (sentTrimmed) recordSentInputToHistory(sentTrimmed);
+        if (inputEl.value === sentText) clearComposerInput();
+        setEditMode(null);
+        return;
+      }
+      const err =
+        typeof anyMsg.error === "string" && anyMsg.error.trim()
+          ? anyMsg.error.trim()
+          : "Steer failed.";
+      showToast("error", err);
+      return;
+    }
     if (anyMsg.type === "controlState") {
       receivedState = true;
       const seq = typeof anyMsg.seq === "number" ? anyMsg.seq : null;
@@ -6172,11 +6277,27 @@ function main(): void {
       if (!sessionId) return;
       if (!state.activeSession || state.activeSession.id !== sessionId) return;
       const block = anyMsg.block as ChatBlock;
+      const insertBeforeRaw = (anyMsg as any).insertBeforeBlockId;
+      const insertBeforeBlockId =
+        typeof insertBeforeRaw === "string"
+          ? insertBeforeRaw
+          : null;
       if (!block || typeof (block as any).id !== "string") return;
       const blocks = state.blocks || [];
       const idx = blocks.findIndex((b) => b && b.id === (block as any).id);
       if (idx >= 0) blocks[idx] = block;
-      else blocks.push(block);
+      else if (
+        insertBeforeBlockId &&
+        insertBeforeBlockId !== block.id
+      ) {
+        const beforeIdx = blocks.findIndex(
+          (b) => b && b.id === insertBeforeBlockId,
+        );
+        if (beforeIdx >= 0) blocks.splice(beforeIdx, 0, block);
+        else blocks.push(block);
+      } else {
+        blocks.push(block);
+      }
       blocksBySessionId.set(sessionId, blocks);
       touchBlockCache(sessionId);
       state = { ...(state as any), blocks } as ChatViewState;

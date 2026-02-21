@@ -822,6 +822,52 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   };
 
+  const handleChatSteer = async (
+    text: string,
+    rewind: { turnId: string; turnIndex?: number } | null = null,
+  ): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    if (!sessions) throw new Error("sessions is not initialized");
+
+    const sessionMaybe = activeSessionId
+      ? sessions.getById(activeSessionId)
+      : null;
+    if (!sessionMaybe) {
+      throw new Error("No session selected.");
+    }
+    const session: Session = sessionMaybe;
+    if (session.backendId === "opencode") {
+      throw new Error("Steer is not supported for opencode sessions.");
+    }
+    if (rewind) {
+      throw new Error("Rewind cannot be used with steer send.");
+    }
+
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith("/")) {
+      throw new Error("Slash commands cannot be sent as steer input.");
+    }
+
+    const rt = ensureRuntime(session.id);
+    if (!rt.sending) {
+      throw new Error("No running turn to steer. Start a turn first.");
+    }
+    const activeTurnId =
+      rt.activeTurnId ?? backendManager.getActiveTurnId(session.threadId);
+    if (!activeTurnId) {
+      throw new Error("Cannot steer because active turn id is not available.");
+    }
+
+    const expanded = await expandMentions(session, text);
+    if (!expanded.ok) {
+      throw new Error(expanded.error);
+    }
+    const expandedText = expanded.text;
+
+    await steerUserInput(session, expandedText, activeTurnId);
+  };
+
   chatView = new ChatViewProvider(
     context,
     () => buildChatState(),
@@ -829,6 +875,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await handleChatSend(text, images, rewind, { queueIfBusy: false }),
     async (text, images = [], rewind = null) =>
       await handleChatSend(text, images, rewind, { queueIfBusy: true }),
+    async (text, rewind = null) => await handleChatSteer(text, rewind),
     async (session, args) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
       const requestID = String(args.requestID ?? "").trim();
@@ -3423,6 +3470,64 @@ async function sendUserInput(
     });
     chatView?.refresh();
     schedulePersistRuntime(session.id);
+    throw err;
+  }
+  schedulePersistRuntime(session.id);
+}
+
+async function steerUserInput(
+  session: Session,
+  text: string,
+  expectedTurnId: string,
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const rt = ensureRuntime(session.id);
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  const mentionInputs: UserInput[] =
+    session.backendId !== "opencode"
+      ? rt.pendingAppMentions
+          .filter(
+            (m) =>
+              Boolean(m.name) && Boolean(m.path) && text.includes(`$${m.name}`),
+          )
+          .map((m) => ({
+            type: "mention" as const,
+            name: m.name,
+            path: m.path,
+          }))
+      : [];
+
+  try {
+    await backendManager.steerMessage(
+      session,
+      text,
+      expectedTurnId,
+      mentionInputs,
+    );
+    rt.pendingAppMentions.length = 0;
+    const userBlockId = newLocalId("user");
+    upsertBlock(session.id, {
+      id: userBlockId,
+      type: "user",
+      text,
+      turnId: expectedTurnId,
+    });
+    sessionPanels?.addUserMessage(session.id, text);
+    chatView?.refresh();
+  } catch (err) {
+    const errText = formatUnknownError(err);
+    outputChannel?.appendLine(
+      `[steer] Failed: sessionId=${session.id} threadId=${session.threadId} turnId=${expectedTurnId} err=${errText}`,
+    );
+    upsertBlock(session.id, {
+      id: newLocalId("error"),
+      type: "error",
+      title: "Steer failed",
+      text: errText,
+    });
+    chatView?.refresh();
     throw err;
   }
   schedulePersistRuntime(session.id);
@@ -6218,6 +6323,8 @@ function applyServerNotification(
       return;
     case "item/agentMessage/delta": {
       const id = (n as any).params.itemId as string;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
       // If we receive assistant deltas after the backend claims the turn is completed, keep the
       // input locked until the item completes. This surfaces an ordering issue without silently
       // allowing the user to start a new turn while output is still streaming.
@@ -6231,6 +6338,7 @@ function applyServerNotification(
         id,
         type: "assistant",
         text: "",
+        turnId: turnId ?? undefined,
         streaming: true,
       }));
       const delta = (n as any).params.delta as string;
@@ -6240,11 +6348,18 @@ function applyServerNotification(
           ? Math.trunc(opencodeSeqRaw)
           : null;
       if (block.type === "assistant") {
+        if (turnId) block.turnId = turnId;
         (block as any).streaming = true;
         if (opencodeSeq !== null) (block as any).opencodeSeq = opencodeSeq;
+        if (!existed) block.text += delta;
       }
       rt.streamingAssistantItemIds.add(id);
       markUnreadSession(sessionId);
+      if (!existed) {
+        sessionPanels?.appendAssistantDelta(sessionId, delta);
+        chatView?.postBlockUpsert(sessionId, block);
+        return;
+      }
       const prev = rt.pendingAssistantDeltas.get(id);
       rt.pendingAssistantDeltas.set(id, prev ? prev + delta : delta);
       scheduleAssistantDeltaFlush(sessionId, rt);
@@ -6252,14 +6367,17 @@ function applyServerNotification(
     }
     case "item/reasoning/summaryTextDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         const p = (n as any).params as { summaryIndex: number; delta: string };
         ensureParts(block.summaryParts, p.summaryIndex);
         block.summaryParts[p.summaryIndex] += p.delta;
@@ -6269,14 +6387,17 @@ function applyServerNotification(
     }
     case "item/reasoning/summaryPartAdded": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         ensureParts(
           block.summaryParts,
           (n as any).params.summaryIndex as number,
@@ -6287,14 +6408,17 @@ function applyServerNotification(
     }
     case "item/reasoning/textDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         const p = (n as any).params as { contentIndex: number; delta: string };
         ensureParts(block.rawParts, p.contentIndex);
         block.rawParts[p.contentIndex] += p.delta;
@@ -6304,7 +6428,9 @@ function applyServerNotification(
     }
     case "item/commandExecution/outputDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "command",
         title: "Command",
@@ -6316,15 +6442,21 @@ function applyServerNotification(
         durationMs: null,
         terminalStdin: [],
         output: "",
+        turnId: turnId ?? undefined,
       }));
       const delta = (n as any).params.delta as string;
-      if (block.type === "command") block.output += delta;
-      chatView?.postBlockAppend(sessionId, id, "commandOutput", delta);
+      if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
+        block.output += delta;
+      }
+      if (!existed) chatView?.postBlockUpsert(sessionId, block);
+      else chatView?.postBlockAppend(sessionId, id, "commandOutput", delta);
       return;
     }
     case "item/commandExecution/terminalInteraction": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "command",
         title: "Command",
@@ -6336,15 +6468,20 @@ function applyServerNotification(
         durationMs: null,
         terminalStdin: [],
         output: "",
+        turnId: turnId ?? undefined,
       }));
-      if (block.type === "command")
+      if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
         block.terminalStdin.push((n as any).params.stdin as string);
+      }
       chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/fileChange/outputDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "fileChange",
         title: "Changes",
@@ -6353,19 +6490,24 @@ function applyServerNotification(
         detail: "",
         hasDiff: rt.latestDiff != null,
         diffs: [],
+        turnId: turnId ?? undefined,
       }));
       const delta = (n as any).params.delta as string;
-      if (block.type === "fileChange") block.detail += delta;
-      if (block.type === "fileChange")
+      if (block.type === "fileChange") {
+        if (turnId) block.turnId = turnId;
+        block.detail += delta;
         block.diffs = diffsForFiles(block.files, rt.latestDiff);
-      chatView?.postBlockAppend(sessionId, id, "fileChangeDetail", delta);
+      }
+      if (!existed) chatView?.postBlockUpsert(sessionId, block);
+      else chatView?.postBlockAppend(sessionId, id, "fileChangeDetail", delta);
       return;
     }
     case "item/mcpToolCall/progress": {
       const id = (n as any).params.itemId as string;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
       const server = String((n as any).params.server ?? "");
       const tool = String((n as any).params.tool ?? "");
-      const block = getOrCreateBlock(rt, id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "mcp",
         title: server === "opencode" ? "OpenCode Tool" : "MCP Tool",
@@ -6373,6 +6515,7 @@ function applyServerNotification(
         server,
         tool,
         detail: "",
+        turnId: turnId ?? undefined,
       }));
       const opencodeSeqRaw = (n as any).params.opencodeSeq as unknown;
       const opencodeSeq =
@@ -6380,6 +6523,7 @@ function applyServerNotification(
           ? Math.trunc(opencodeSeqRaw)
           : null;
       if (block.type === "mcp") {
+        if (turnId) block.turnId = turnId;
         block.tool = tool;
         block.detail += `${String((n as any).params.message ?? "")}\n`;
         if (server === "opencode" && opencodeSeq !== null) {
@@ -6569,10 +6713,12 @@ function applyServerNotification(
     case "item/started":
     case "item/completed": {
       const item = (n as any).params.item as ThreadItem;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
       applyItemLifecycle(
         rt,
         sessionId,
         String((n as any).params.threadId ?? ""),
+        turnId,
         item,
         n.method === "item/completed",
       );
@@ -6601,18 +6747,20 @@ function applyItemLifecycle(
   rt: SessionRuntime,
   sessionId: string,
   threadId: string,
+  turnId: string | null,
   item: ThreadItem,
   completed: boolean,
 ): void {
   const statusText = completed ? "completed" : "started";
   switch (item.type) {
     case "reasoning": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "reasoning",
         summaryParts: [...item.summary],
         rawParts: [...item.content],
         status: completed ? "completed" : "inProgress",
+        turnId: turnId ?? undefined,
       }));
       const opencodeSeqRaw = (item as any).opencodeSeq as unknown;
       const opencodeSeq =
@@ -6620,6 +6768,7 @@ function applyItemLifecycle(
           ? Math.trunc(opencodeSeqRaw)
           : null;
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         block.status = completed ? "completed" : "inProgress";
         if (completed) {
           block.summaryParts = [...item.summary];
@@ -6631,7 +6780,7 @@ function applyItemLifecycle(
       break;
     }
     case "commandExecution": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "command",
         title: "Command",
@@ -6647,8 +6796,10 @@ function applyItemLifecycle(
         durationMs: item.durationMs,
         terminalStdin: [],
         output: item.aggregatedOutput ?? "",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.command = item.command;
         block.hideCommandText = shouldHideCommandText(
@@ -6678,7 +6829,7 @@ function applyItemLifecycle(
       const files = item.changes.map((c) =>
         formatPathForSession(c.path, workspaceFolderFsPath),
       );
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "fileChange",
         title: "Changes",
@@ -6687,8 +6838,10 @@ function applyItemLifecycle(
         detail: "",
         hasDiff: true,
         diffs: diffsForFiles(files, rt.latestDiff),
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "fileChange") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.files = files;
         block.hasDiff = true;
@@ -6698,7 +6851,7 @@ function applyItemLifecycle(
       break;
     }
     case "mcpToolCall": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "mcp",
         title: item.server === "opencode" ? "OpenCode Tool" : "MCP Tool",
@@ -6706,8 +6859,10 @@ function applyItemLifecycle(
         server: item.server,
         tool: item.tool,
         detail: "",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "mcp") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.server = item.server;
         block.tool = item.tool;
@@ -6745,6 +6900,7 @@ function applyItemLifecycle(
         ? item.receiverThreadIds.map((id) => String(id))
         : [];
       const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
+      const callId = String(item.id ?? "").trim();
       const agentsStates =
         item.agentsStates && typeof item.agentsStates === "object"
           ? (item.agentsStates as Record<
@@ -6753,12 +6909,57 @@ function applyItemLifecycle(
             >)
           : {};
 
+      let title = "Sub-agent";
       const detailLines: string[] = [];
-      if (tool) detailLines.push(`tool: ${tool}`);
-      if (senderThreadId) detailLines.push(`sender: ${senderThreadId}`);
-      if (receiverThreadIds.length > 0) {
-        detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
+      if (callId) detailLines.push(`call: ${callId}`);
+      switch (tool) {
+        case "spawnAgent": {
+          title = "Agent spawned";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`agent: ${receiverThreadIds.join(", ")}`);
+          } else {
+            detailLines.push("agent: not created");
+          }
+          break;
+        }
+        case "sendInput": {
+          title = "Input sent";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "wait": {
+          title = item.status === "inProgress" ? "Waiting for agents" : "Wait complete";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "closeAgent": {
+          title = "Agent closed";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "resumeAgent": {
+          title = item.status === "inProgress" ? "Resuming agent" : "Agent resumed";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        default: {
+          if (tool) detailLines.push(`tool: ${tool}`);
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
       }
+
+      if (senderThreadId) detailLines.push(`sender: ${senderThreadId}`);
 
       const agentStateLines = Object.keys(agentsStates)
         .sort()
@@ -6783,17 +6984,20 @@ function applyItemLifecycle(
         detailLines.push(prompt);
       }
 
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "collab",
-        title: "Sub-agent",
+        title,
         status: item.status,
         tool,
         senderThreadId,
         receiverThreadIds,
         detail: detailLines.join("\n"),
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "collab") {
+        if (turnId) block.turnId = turnId;
+        block.title = title;
         block.status = item.status;
         block.tool = tool;
         block.senderThreadId = senderThreadId;
@@ -6829,12 +7033,19 @@ function applyItemLifecycle(
         }
       }
 
-      upsertBlock(sessionId, {
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "webSearch",
         query: item.query,
         status: completed ? "completed" : "inProgress",
-      });
+        turnId: turnId ?? undefined,
+      }));
+      if (block.type === "webSearch") {
+        if (turnId) block.turnId = turnId;
+        block.query = item.query;
+        block.status = completed ? "completed" : "inProgress";
+      }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "imageView": {
@@ -6865,9 +7076,11 @@ function applyItemLifecycle(
         id,
         type: "assistant",
         text: "",
+        turnId: turnId ?? undefined,
         streaming: !completed,
       }));
       if (block.type === "assistant") {
+        if (turnId) block.turnId = turnId;
         if (completed) {
           // If the "completed" item arrives before the pending delta flush runs, drop the
           // pending delta buffer for this item. The completed payload already contains the
@@ -7542,6 +7755,22 @@ function getOrCreateBlock(
     return block;
   }
   return rt.blocks[idx]!;
+}
+
+function getOrCreateTurnAnchoredBlock(
+  rt: SessionRuntime,
+  id: string,
+  turnId: string | null,
+  create: () => ChatBlock,
+): ChatBlock {
+  const idx = rt.blockIndexById.get(id);
+  if (idx !== undefined) return rt.blocks[idx]!;
+
+  void turnId;
+  const block = create();
+  rt.blockIndexById.set(id, rt.blocks.length);
+  rt.blocks.push(block);
+  return block;
 }
 
 function rebuildBlockIndex(rt: SessionRuntime): void {
@@ -8807,7 +9036,7 @@ function hydrateRuntimeFromThread(
   const turns: Turn[] = Array.isArray(thread.turns) ? thread.turns : [];
   for (const turn of turns) {
     for (const item of turn.items ?? []) {
-      applyItemLifecycle(rt, sessionId, thread.id, item, true);
+      applyItemLifecycle(rt, sessionId, thread.id, turn.id, item, true);
       if (item.type === "userMessage") {
         const text = item.content
           .filter((c) => c.type === "text")
@@ -8827,6 +9056,7 @@ function hydrateRuntimeFromThread(
             id: item.id,
             type: "assistant",
             text: item.text,
+            turnId: turn.id,
             streaming: false,
           });
       }

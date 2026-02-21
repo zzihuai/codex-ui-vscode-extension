@@ -4,7 +4,29 @@
 
 ## Unreleased
 
-- (no changes yet)
+_No unreleased changes yet._
+
+## 0.2.13
+
+- **Sub-agent UI**
+  - `collabAgentToolCall` を tool別に表示し、`spawn/wait/close/resume/send` の見出しを専用化（例: `Agent spawned`, `Waiting for agents`, `Agent resumed`）
+  - Sub-agent ブロック本文に `call`, `receiver(s)`, `sender`, `agents` 状態, `prompt` を整理して表示
+- **Steer / Queue UI**
+  - 実行中ターンの追加入力を専用UIに分離し、入力欄上に `Steer send` / `Queue next` ボタンを表示
+  - 実行中に Enter を押した場合は新規 `turn/start` ではなく `Steer send` と同等の送信に変更
+  - `Tab` による暗黙の queue 送信を廃止し、`Queue next` ボタンからのみキュー投入する挙動へ変更
+- **Steer transport (codez/codex)**
+  - `turn/steer` RPC を追加実装し、実行中ターンへ追加入力を送信可能に
+  - steer 送信時の user ブロックに実行中 `turnId` を紐付けてチャット履歴へ反映
+  - steer 失敗時に入力欄テキストを消さず、再送できるように修正
+  - steer 失敗時に未送信 user ブロックが履歴へ残る問題を修正（成功時のみ反映）
+  - steer 送信不可条件（実行ターンなし等）を失敗応答として返すよう修正し、UIが成功扱いで入力を消してしまう問題を修正
+  - steer の user ブロックを「送信時点の位置」に挿入し、最終応答が末尾に出ない並び崩れを軽減
+- **Ordering**
+  - OpenCode の同一 `opencodeSeq` 内で `command/fileChange/webSearch` を `assistant` より先に並べるよう調整
+  - codez/codex の同一 `turnId` 内で tool 系ブロック（command/fileChange/mcp/collab/reasoning/webSearch）の初回挿入位置を `assistant` より前に固定し、`item/completed` 初見時に末尾へ落ちる問題を修正
+  - `item/agentMessage/delta` 初回受信時に assistant ブロックを即時 upsert してから delta を反映し、未生成ブロックへの append が捨てられて assistant が末尾に固まる問題を修正
+  - tool/reasoning/assistant の並びを `turnId` アンカー依存から `itemId` 初回観測順（到着順）に統一し、1ターン内で assistant が複数ある場合の不自然な再配置を修正
 
 ## 0.2.10
 
