@@ -4,17 +4,31 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import type { Session } from "../sessions";
-import type { AskUserQuestionRequest } from "../generated/AskUserQuestionRequest";
-import type { AskUserQuestionResponse } from "../generated/v2/AskUserQuestionResponse";
+import { isCodexFamilyBackend } from "../session_backend";
+import { drainPendingRequestUserInput } from "./request_user_input_pending";
+import { shouldAutoReloadOnChatTabVisible } from "./chat_visibility";
 
 export type ChatBlock =
-  | { id: string; type: "user"; text: string }
+  | { id: string; type: "user"; text: string; turnId?: string }
   | {
       id: string;
       type: "assistant";
       text: string;
+      turnId?: string;
       streaming?: boolean;
       meta?: string | null;
+    }
+  | {
+      id: string;
+      type: "opencodePermission";
+      requestID: string;
+      permission: string;
+      status: "pending" | "replied" | "error";
+      patterns: string[];
+      always: string[];
+      metadata: Record<string, unknown> | null;
+      reply?: "once" | "always" | "reject" | null;
+      error?: string | null;
     }
   | {
       id: string;
@@ -55,13 +69,20 @@ export type ChatBlock =
       role: "user" | "assistant" | "tool" | "system";
     }
   | { id: string; type: "info"; title: string; text: string }
-  | { id: string; type: "webSearch"; query: string; status: string }
+  | {
+      id: string;
+      type: "webSearch";
+      query: string;
+      status: string;
+      turnId?: string;
+    }
   | {
       id: string;
       type: "reasoning";
       summaryParts: string[];
       rawParts: string[];
       status: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -76,6 +97,7 @@ export type ChatBlock =
       durationMs: number | null;
       terminalStdin: string[];
       output: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -86,6 +108,7 @@ export type ChatBlock =
       detail: string;
       hasDiff: boolean;
       diffs?: Array<{ path: string; diff: string }>;
+      turnId?: string;
     }
   | {
       id: string;
@@ -95,6 +118,18 @@ export type ChatBlock =
       server: string;
       tool: string;
       detail: string;
+      turnId?: string;
+    }
+  | {
+      id: string;
+      type: "collab";
+      title: string;
+      status: string;
+      tool: string;
+      senderThreadId: string;
+      receiverThreadIds: string[];
+      detail: string;
+      turnId?: string;
     }
   | {
       id: string;
@@ -118,10 +153,22 @@ export type ChatBlock =
         inputPreview?: string | null;
         detail: string;
       }>;
+      turnId?: string;
     }
   | { id: string; type: "plan"; title: string; text: string }
   | { id: string; type: "error"; title: string; text: string }
-  | { id: string; type: "system"; title: string; text: string };
+  | { id: string; type: "system"; title: string; text: string }
+  | {
+      id: string;
+      type: "actionCard";
+      title: string;
+      text: string;
+      actions: Array<{
+        id: string;
+        label: string;
+        style?: "primary" | "default";
+      }>;
+    };
 
 export type ChatViewState = {
   capabilities?: {
@@ -145,6 +192,7 @@ export type ChatViewState = {
   reloading: boolean;
   hydrationBlockedText?: string | null;
   opencodeDefaultModelKey?: string | null;
+  opencodeDefaultAgentName?: string | null;
   cliDefaultModelState?: ModelState | null;
   statusText?: string | null;
   statusTooltip?: string | null;
@@ -154,6 +202,9 @@ export type ChatViewState = {
     model: string;
     displayName: string;
     description: string;
+    upgrade?: string | null;
+    inputModalities?: string[] | null;
+    supportsPersonality?: boolean | null;
     supportedReasoningEfforts: Array<{
       reasoningEffort: string;
       description: string;
@@ -161,31 +212,47 @@ export type ChatViewState = {
     defaultReasoningEffort: string;
     isDefault: boolean;
   }> | null;
+  collaborationModeLabel?: string | null;
   approvals: Array<{
     requestKey: string;
     title: string;
     detail: string;
     canAcceptForSession: boolean;
   }>;
+  // Session ids that currently require an approval decision (e.g. command/file change approvals).
+  // Used to tint the tab like request_user_input does.
+  approvalSessionIds?: string[];
 };
 
 type RewindRequest = {
-  turnIndex: number;
+  turnId: string;
+  turnIndex?: number;
 };
 
-let sessionModelState: {
+const EMPTY_MODEL_STATE: {
   model: string | null;
   provider: string | null;
   reasoning: string | null;
-} = { model: null, provider: null, reasoning: null };
+  agent: string | null;
+} = { model: null, provider: null, reasoning: null, agent: null };
 
-export type ModelState = typeof sessionModelState;
+// Loaded from ~/.codex/config.toml (or equivalent). This is used only to label what "default"
+// means in the UI; it must not implicitly override per-session settings.
+let cliDefaultModelState: {
+  model: string | null;
+  provider: string | null;
+  reasoning: string | null;
+  agent: string | null;
+} = { ...EMPTY_MODEL_STATE };
+
+export type ModelState = typeof EMPTY_MODEL_STATE;
 
 const modelStateBySessionId = new Map<string, ModelState>();
+const explicitModelOverrideBySessionId = new Set<string>();
 
 export function getSessionModelState(sessionId: string | null): ModelState {
-  if (!sessionId) return sessionModelState;
-  return modelStateBySessionId.get(sessionId) ?? sessionModelState;
+  if (!sessionId) return cliDefaultModelState;
+  return modelStateBySessionId.get(sessionId) ?? EMPTY_MODEL_STATE;
 }
 
 export function hasSessionModelState(sessionId: string): boolean {
@@ -199,8 +266,12 @@ export function setSessionModelState(
   modelStateBySessionId.set(sessionId, state);
 }
 
+export function isSessionModelOverrideExplicit(sessionId: string): boolean {
+  return explicitModelOverrideBySessionId.has(sessionId);
+}
+
 export function setDefaultModelState(state: ModelState): void {
-  sessionModelState = state;
+  cliDefaultModelState = state;
 }
 
 function asNullableString(v: unknown): string | null {
@@ -235,13 +306,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     string,
     string
   >();
-  private readonly pendingAskUserQuestionsByKey = new Map<
+  private opencodeAgentsCache: Array<{
+    id: string;
+    name: string;
+    description?: string;
+  }> | null = null;
+  private opencodeAgentsCacheSessionId: string | null = null;
+  private readonly pendingRequestUserInput = new Map<
     string,
-    {
-      resolve: (resp: AskUserQuestionResponse) => void;
-      reject: (err: unknown) => void;
-    }
+    (resp: {
+      cancelled: boolean;
+      answersById: Record<string, string[]>;
+    }) => void
   >();
+  private autoReloadOnVisibleInFlight = false;
 
   public insertIntoInput(text: string): void {
     this.view?.webview.postMessage({ type: "insertText", text });
@@ -249,6 +327,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public toast(kind: "info" | "success" | "error", message: string): void {
     this.view?.webview.postMessage({ type: "toast", kind, message });
+  }
+
+  public async promptRequestUserInput(args: {
+    sessionId: string;
+    requestKey: string;
+    params: unknown;
+  }): Promise<{ cancelled: boolean; answersById: Record<string, string[]> }> {
+    if (!this.view) {
+      await this.viewReadyPromise;
+    }
+    if (!this.view) {
+      return { cancelled: true, answersById: {} };
+    }
+    return await new Promise((resolve) => {
+      this.pendingRequestUserInput.set(args.requestKey, resolve);
+      void this.view?.webview.postMessage({
+        type: "requestUserInputStart",
+        sessionId: args.sessionId,
+        requestKey: args.requestKey,
+        params: args.params,
+      });
+    });
+  }
+
+  public invalidateSkillIndex(sessionId: string): void {
+    this.view?.webview.postMessage({ type: "skillIndexInvalidate", sessionId });
+  }
+
+  public postSkillIndex(
+    sessionId: string,
+    skills: Array<{
+      name: string;
+      description: string | null;
+      scope: string;
+      path: string;
+    }>,
+  ): void {
+    this.view?.webview.postMessage({
+      type: "skillIndex",
+      sessionId,
+      skills,
+    });
   }
 
   public notifyAccountLoginCompleted(args: {
@@ -269,6 +389,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       text: string,
       images?: Array<{ name: string; url: string }>,
       rewind?: RewindRequest | null,
+    ) => Promise<void>,
+    private readonly onQueueSend: (
+      text: string,
+      images?: Array<{ name: string; url: string }>,
+      rewind?: RewindRequest | null,
+    ) => Promise<void>,
+    private readonly onSteer: (
+      text: string,
+      rewind?: RewindRequest | null,
+    ) => Promise<void>,
+    private readonly onOpencodePermissionReply: (
+      session: Session,
+      args: { requestID: string; reply: "once" | "always" | "reject" },
     ) => Promise<void>,
     private readonly onAccountList: (
       session: Session,
@@ -308,6 +441,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cancellationToken: string,
     ) => Promise<string[]>,
     private readonly onListAgents: (sessionId: string) => Promise<string[]>,
+    private readonly onListOpencodeAgents: (
+      session: Session,
+    ) => Promise<Array<{ id: string; name: string; description?: string }>>,
     private readonly onListSkills: (sessionId: string) => Promise<
       Array<{
         name: string;
@@ -316,6 +452,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         path: string;
       }>
     >,
+    private readonly onActionCardAction: (args: {
+      sessionId: string;
+      cardId: string;
+      actionId: string;
+    }) => Promise<void>,
     private readonly onLoadImage: (
       imageKey: string,
     ) => Promise<{ mimeType: string; base64: string }>,
@@ -330,61 +471,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   public reveal(): void {
     this.view?.show?.(true);
-  }
-
-  public async promptAskUserQuestion(args: {
-    requestKey: string;
-    request: AskUserQuestionRequest;
-  }): Promise<AskUserQuestionResponse> {
-    if (this.pendingAskUserQuestionsByKey.has(args.requestKey)) {
-      throw new Error(
-        `AskUserQuestion already pending for requestKey=${args.requestKey}`,
-      );
-    }
-
-    const withTimeout = async <T>(
-      p: Promise<T>,
-      timeoutMs: number,
-    ): Promise<T> => {
-      if (timeoutMs <= 0) return await p;
-      return await Promise.race([
-        p,
-        new Promise<T>((_, reject) => {
-          setTimeout(
-            () => reject(new Error("Timed out waiting for chat view")),
-            timeoutMs,
-          );
-        }),
-      ]);
-    };
-
-    // Ensure the webview is available before prompting.
-    // If the user never opened the view, the provider hasn't been resolved yet.
-    await withTimeout(this.viewReadyPromise, 5000);
-    if (!this.view) {
-      throw new Error("Chat view is not available (webview not initialized)");
-    }
-
-    const p = new Promise<AskUserQuestionResponse>((resolve, reject) => {
-      this.pendingAskUserQuestionsByKey.set(args.requestKey, {
-        resolve,
-        reject,
-      });
-    });
-
-    try {
-      await this.view.webview.postMessage({
-        type: "askUserQuestionStart",
-        requestKey: args.requestKey,
-        request: args.request,
-      });
-    } catch (err) {
-      const pending = this.pendingAskUserQuestionsByKey.get(args.requestKey);
-      this.pendingAskUserQuestionsByKey.delete(args.requestKey);
-      pending?.reject(err);
-    }
-
-    return await p;
   }
 
   public refresh(): void {
@@ -421,8 +507,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const st = this.getState();
     const active = st.activeSession;
     if (!active || active.id !== sessionId) return;
+    const insertBeforeRaw = (block as any).__insertBeforeBlockId;
+    const insertBeforeBlockId =
+      typeof insertBeforeRaw === "string" && insertBeforeRaw.trim().length > 0
+        ? insertBeforeRaw.trim()
+        : undefined;
+    if (insertBeforeBlockId) delete (block as any).__insertBeforeBlockId;
     void this.view.webview
-      .postMessage({ type: "blockUpsert", sessionId, block })
+      .postMessage({
+        type: "blockUpsert",
+        sessionId,
+        block,
+        insertBeforeBlockId,
+      })
       .then(undefined, (err) => {
         this.onUiError(
           `Failed to post block update to webview: ${String(err)}`,
@@ -474,11 +571,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     });
     view.onDidChangeVisibility(() => {
-      if (view.visible) this.refresh();
+      if (!view.visible) return;
+      this.refresh();
+      if (this.autoReloadOnVisibleInFlight) return;
+      if (!shouldAutoReloadOnChatTabVisible(this.getState())) return;
+      this.autoReloadOnVisibleInFlight = true;
+      void vscode.commands
+        .executeCommand("codez.reloadSession")
+        .then(
+          () => {
+            this.autoReloadOnVisibleInFlight = false;
+          },
+          (err: unknown) => {
+            this.autoReloadOnVisibleInFlight = false;
+            this.onUiError(`Auto reload failed: ${String(err)}`);
+          },
+        );
     });
     this.resolveViewReady?.();
     this.resolveViewReady = null;
     view.onDidDispose(() => {
+      drainPendingRequestUserInput(this.pendingRequestUserInput);
       this.view = null;
       this.statePostInFlight = false;
       this.statePostDirty = false;
@@ -488,16 +601,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this.blockAppendFlushTimer) clearTimeout(this.blockAppendFlushTimer);
       this.blockAppendFlushTimer = null;
       this.pendingBlockAppends.clear();
-
-      // Explicitly fail any pending AskUserQuestion prompts; the UI is gone.
-      for (const [requestKey, pending] of this.pendingAskUserQuestionsByKey) {
-        pending.reject(
-          new Error(
-            `Chat view disposed while AskUserQuestion pending (requestKey=${requestKey})`,
-          ),
-        );
-      }
-      this.pendingAskUserQuestionsByKey.clear();
 
       // Reset the ready barrier so future prompts wait for a new webview.
       this.viewReadyPromise = new Promise((resolve) => {
@@ -603,26 +706,120 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    if (type === "askUserQuestionResponse") {
-      const requestKey = anyMsg["requestKey"];
-      const response = anyMsg["response"];
-      if (typeof requestKey !== "string" || !requestKey) return;
-      if (typeof response !== "object" || response === null) return;
+    if (type === "queueSend") {
+      const text = anyMsg["text"];
+      const rewind = anyMsg["rewind"];
+      if (typeof text !== "string") return;
+      await this.onQueueSend(text, [], (rewind as any) ?? null);
+      return;
+    }
 
-      const cancelled = Boolean((response as any)["cancelled"]);
-      const answersRaw = (response as any)["answers"];
-      const answers =
-        typeof answersRaw === "object" && answersRaw !== null ? answersRaw : {};
+    if (type === "queueSendWithImages") {
+      const text = anyMsg["text"];
+      const images = anyMsg["images"];
+      const rewind = anyMsg["rewind"];
+      if (typeof text !== "string") return;
+      if (!Array.isArray(images)) return;
+      const normalized = images
+        .filter(
+          (img) =>
+            typeof img === "object" &&
+            img !== null &&
+            typeof (img as any).url === "string",
+        )
+        .map((img) => ({
+          name: typeof (img as any).name === "string" ? (img as any).name : "",
+          url: (img as any).url as string,
+        }));
+      await this.onQueueSend(text, normalized, (rewind as any) ?? null);
+      return;
+    }
 
-      const pending = this.pendingAskUserQuestionsByKey.get(requestKey);
-      if (!pending) {
-        this.onUiError(
-          `AskUserQuestion response ignored; no pending request (requestKey=${requestKey})`,
-        );
-        return;
+    if (type === "steer") {
+      const text = anyMsg["text"];
+      const rewind = anyMsg["rewind"];
+      const requestId = anyMsg["requestId"];
+      if (typeof text !== "string") return;
+      if (typeof requestId !== "string" || !requestId) return;
+      try {
+        await this.onSteer(text, (rewind as any) ?? null);
+        void this.view?.webview.postMessage({
+          type: "steerResult",
+          requestId,
+          ok: true,
+        });
+      } catch (err) {
+        const error =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : JSON.stringify(err);
+        void this.view?.webview.postMessage({
+          type: "steerResult",
+          requestId,
+          ok: false,
+          error,
+        });
       }
-      this.pendingAskUserQuestionsByKey.delete(requestKey);
-      pending.resolve({ cancelled, answers });
+      return;
+    }
+
+    if (type === "requestUserInputResponse") {
+      const requestKey = anyMsg["requestKey"];
+      if (typeof requestKey !== "string" || !requestKey) return;
+      const response = anyMsg["response"] as
+        | { cancelled?: unknown; answers?: unknown }
+        | undefined;
+      const cancelled = Boolean(response?.cancelled);
+      const answersById: Record<string, string[]> = {};
+      if (
+        response &&
+        typeof response.answers === "object" &&
+        response.answers
+      ) {
+        for (const [key, val] of Object.entries(
+          response.answers as Record<string, unknown>,
+        )) {
+          const raw = (val as any)?.answers;
+          if (Array.isArray(raw))
+            answersById[key] = raw
+              .map((v) => String(v ?? "").trim())
+              .filter(Boolean);
+        }
+      }
+      const resolver = this.pendingRequestUserInput.get(requestKey);
+      if (resolver) {
+        this.pendingRequestUserInput.delete(requestKey);
+        resolver({ cancelled, answersById });
+      }
+      return;
+    }
+
+    if (type === "actionCardAction") {
+      const sessionId = anyMsg["sessionId"];
+      const cardId = anyMsg["cardId"];
+      const actionId = anyMsg["actionId"];
+      if (typeof sessionId !== "string" || !sessionId) return;
+      if (typeof cardId !== "string" || !cardId) return;
+      if (typeof actionId !== "string" || !actionId) return;
+      await this.onActionCardAction({ sessionId, cardId, actionId });
+      return;
+    }
+
+    if (type === "opencodePermissionReply") {
+      const sessionId = anyMsg["sessionId"];
+      const requestID = anyMsg["requestID"];
+      const reply = anyMsg["reply"];
+      if (typeof sessionId !== "string" || !sessionId) return;
+      if (typeof requestID !== "string" || !requestID) return;
+      if (reply !== "once" && reply !== "always" && reply !== "reject") return;
+      const st = this.getState();
+      const session =
+        (st.sessions || []).find((s) => s.id === sessionId) ?? null;
+      if (!session) return;
+      if (session.backendId !== "opencode") return;
+      await this.onOpencodePermissionReply(session, { requestID, reply });
       return;
     }
 
@@ -679,12 +876,57 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (type === "moveWorkspaceTab") {
+      const workspaceFolderUri = anyMsg["workspaceFolderUri"];
+      const targetWorkspaceFolderUri = anyMsg["targetWorkspaceFolderUri"];
+      const position = anyMsg["position"];
+      if (typeof workspaceFolderUri !== "string" || !workspaceFolderUri.trim())
+        return;
+      if (
+        targetWorkspaceFolderUri !== null &&
+        typeof targetWorkspaceFolderUri !== "string"
+      )
+        return;
+      if (position !== "before" && position !== "after" && position !== "end")
+        return;
+      await vscode.commands.executeCommand("codez._internal.moveWorkspaceTab", {
+        workspaceFolderUri,
+        targetWorkspaceFolderUri,
+        position,
+      });
+      return;
+    }
+
+    if (type === "moveSessionTab") {
+      const workspaceFolderUri = anyMsg["workspaceFolderUri"];
+      const sessionId = anyMsg["sessionId"];
+      const targetSessionId = anyMsg["targetSessionId"];
+      const position = anyMsg["position"];
+      if (typeof workspaceFolderUri !== "string" || !workspaceFolderUri.trim())
+        return;
+      if (typeof sessionId !== "string" || !sessionId.trim()) return;
+      if (targetSessionId !== null && typeof targetSessionId !== "string")
+        return;
+      if (position !== "before" && position !== "after" && position !== "end")
+        return;
+      await vscode.commands.executeCommand("codez._internal.moveSessionTab", {
+        workspaceFolderUri,
+        sessionId,
+        targetSessionId,
+        position,
+      });
+      return;
+    }
+
     if (type === "loadSessionHistory") {
       const sessionId = anyMsg["sessionId"];
       if (typeof sessionId !== "string") return;
-      await vscode.commands.executeCommand("codez._internal.loadHistoryForSession", {
-        sessionId,
-      });
+      await vscode.commands.executeCommand(
+        "codez._internal.loadHistoryForSession",
+        {
+          sessionId,
+        },
+      );
       return;
     }
 
@@ -733,6 +975,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (type === "showStatus") {
       await vscode.commands.executeCommand("codez.showStatus");
+      return;
+    }
+
+    if (type === "cycleCollaborationMode") {
+      const sessionId = anyMsg["sessionId"];
+      if (typeof sessionId !== "string" || !sessionId) return;
+      await vscode.commands.executeCommand("codez.cycleCollaborationMode", {
+        sessionId,
+      });
       return;
     }
 
@@ -809,10 +1060,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (op === "reopenSessionInBackend") {
           const backendId = anyMsg["backendId"];
           const sessionId = anyMsg["sessionId"];
-          if (
-            typeof backendId !== "string" ||
-            (backendId !== "codex" && backendId !== "codez")
-          ) {
+          if (typeof backendId !== "string" || !isCodexFamilyBackend(backendId)) {
             await respondErr("Invalid backendId.");
             return;
           }
@@ -836,7 +1084,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (sessionBackendId !== "opencode") {
             await respondOk({
               unsupported: true,
-              message: "このセッションは opencode ではありません。",
+              message: "This session is not an opencode session.",
             });
             return;
           }
@@ -849,7 +1097,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (sessionBackendId !== "opencode") {
             await respondOk({
               unsupported: true,
-              message: "このセッションは opencode ではありません。",
+              message: "This session is not an opencode session.",
             });
             return;
           }
@@ -879,7 +1127,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (sessionBackendId !== "opencode") {
             await respondOk({
               unsupported: true,
-              message: "このセッションは opencode ではありません。",
+              message: "This session is not an opencode session.",
             });
             return;
           }
@@ -913,7 +1161,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (sessionBackendId !== "opencode") {
             await respondOk({
               unsupported: true,
-              message: "このセッションは opencode ではありません。",
+              message: "This session is not an opencode session.",
             });
             return;
           }
@@ -940,7 +1188,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await respondOk({
               unsupported: true,
               message:
-                "アカウントの作成/切り替えは codez セッションのみ対応です。codez セッションを開くか、このスレッドを codez で開き直してください。",
+                "Account creation/switching is supported for codez sessions only. Open a codez session, or reopen this thread in codez.",
             });
             return;
           }
@@ -1013,7 +1261,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const model = asNullableString(anyMsg["model"]);
       const provider = asNullableString(anyMsg["provider"]);
       const reasoning = asNullableString(anyMsg["reasoning"]);
-      setSessionModelState(sessionId, { model, provider, reasoning });
+      const agent = asNullableString(anyMsg["agent"]);
+      setSessionModelState(sessionId, { model, provider, reasoning, agent });
+      // Only mark explicit overrides when the user picks a non-default value.
+      // This lets us distinguish between user intent and (older) UI bugs that
+      // accidentally wrote the backend's effective model into the selector state.
+      if (model || provider || reasoning || agent)
+        explicitModelOverrideBySessionId.add(sessionId);
+      else explicitModelOverrideBySessionId.delete(sessionId);
       this.refresh();
       return;
     }
@@ -1406,10 +1661,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       reloading: full.reloading,
       statusText: full.statusText,
       statusTooltip: full.statusTooltip,
+      cliDefaultModelState: full.cliDefaultModelState,
       modelState: full.modelState,
       models: full.models,
+      collaborationModeLabel: full.collaborationModeLabel,
       approvals: full.approvals,
       customPrompts: full.customPrompts,
+      opencodeAgents: this.opencodeAgentsCache,
+      opencodeDefaultModelKey: full.opencodeDefaultModelKey,
+      opencodeDefaultAgentName: full.opencodeDefaultAgentName,
+      approvalSessionIds: full.approvalSessionIds,
     };
     void this.view.webview
       .postMessage({ type: "controlState", seq, state: controlState })
@@ -1422,6 +1683,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
 
     const activeId = full.activeSession?.id ?? null;
+    const activeBackendId = full.activeSession?.backendId ?? null;
+
+    // Fetch opencode agents when the active session changes to an opencode session
+    if (
+      activeId &&
+      activeId !== this.opencodeAgentsCacheSessionId &&
+      activeBackendId === "opencode"
+    ) {
+      this.opencodeAgentsCacheSessionId = activeId;
+      void (async () => {
+        try {
+          const session = full.activeSession;
+          if (session) {
+            this.opencodeAgentsCache = await this.onListOpencodeAgents(session);
+            this.postControlState();
+          }
+        } catch (err) {
+          this.onUiDebug(`Failed to load opencode agents: ${String(err)}`);
+          this.opencodeAgentsCache = [];
+        }
+      })();
+    } else if (activeBackendId !== "opencode") {
+      this.opencodeAgentsCache = null;
+      this.opencodeAgentsCacheSessionId = null;
+    }
+
     if (activeId && activeId !== this.blocksSessionIdSynced) {
       this.blocksSessionIdSynced = activeId;
       void this.view.webview
@@ -1501,6 +1788,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       button.iconBtn.settingsBtn::before { content: "⚙"; font-size: 14px; }
       .footerBar { border-top: 1px solid rgba(127,127,127,0.25); padding: 8px 12px 10px; display: flex; flex-wrap: nowrap; gap: 10px; align-items: center; position: relative; }
       .modelBar { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; margin: 0; min-width: 0; flex: 1 1 auto; overflow: hidden; }
+      .modeBadge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid rgba(127,127,127,0.35); opacity: 0.85; white-space: nowrap; }
       .modelSelect { background: var(--vscode-input-background); color: inherit; border: 1px solid rgba(127,127,127,0.35); border-radius: 6px; padding: 4px 6px; }
       .modelSelect.model { width: 160px; max-width: 160px; }
       .modelSelect.effort { width: 110px; max-width: 110px; }
@@ -1509,10 +1797,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .statusPopover { position: absolute; right: 12px; bottom: calc(100% + 6px); max-width: min(520px, calc(100vw - 24px)); background: var(--vscode-editorHoverWidget-background, var(--vscode-input-background)); border: 1px solid rgba(127,127,127,0.35); border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.25); padding: 8px 10px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
       .tabs { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; padding-bottom: 2px; }
       .tabGroup { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: 12px; border: 2px solid var(--wt-color); flex: 0 0 auto; align-items: flex-start; }
-      .tabGroupLabel { align-self: flex-start; font-size: 10px; line-height: 1; padding: 3px 6px; border-radius: 999px; background: var(--vscode-editorHoverWidget-background, var(--vscode-input-background)); border: 1px solid rgba(127,127,127,0.35); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+      .tabGroupLabel { align-self: flex-start; font-size: 10px; line-height: 1; padding: 3px 6px; border-radius: 999px; background: var(--vscode-editorHoverWidget-background, var(--vscode-input-background)); border: 1px solid rgba(127,127,127,0.35); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; user-select: none; cursor: grab; }
+      .tabGroupLabel.dragging { cursor: grabbing; opacity: 0.8; }
       .tabGroupTabs { display: flex; gap: 6px; width: fit-content; }
-      .tab { padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,0.35); cursor: pointer; white-space: nowrap; user-select: none; }
+      .tab { padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,0.35); cursor: grab; white-space: nowrap; user-select: none; }
+      .tab.dragging { opacity: 0.5; }
+      .dropBefore { outline: 2px solid rgba(0, 120, 212, 0.85); outline-offset: 2px; }
+      .dropAfter { outline: 2px solid rgba(0, 120, 212, 0.85); outline-offset: 2px; }
       .tab.active { border-color: rgba(0, 120, 212, 0.9); }
+      .tab.needsInput { border-color: var(--wt-color); box-shadow: 0 0 0 1px var(--wt-color) inset; }
+      .tab.needsInput::after { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 999px; background: var(--wt-color); margin-left: 6px; transform: translateY(-1px); }
       .tab.unread { background: rgba(255, 185, 0, 0.14); }
       .tab.running { background: rgba(0, 120, 212, 0.12); }
       .log { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px; }
@@ -1538,6 +1832,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .tool { background: rgba(153, 69, 255, 0.10); }
       .tool.changes { background: rgba(255, 140, 0, 0.10); }
       .tool.mcp { background: rgba(0, 200, 170, 0.08); }
+      .tool.collab { background: rgba(0, 150, 200, 0.12); border-color: rgba(0, 150, 200, 0.35); }
       .tool.webSearch { background: rgba(0, 180, 255, 0.10); border-color: rgba(0, 180, 255, 0.22); }
       .tool.step { background: rgba(153, 69, 255, 0.06); border-color: rgba(153, 69, 255, 0.18); }
       details.toolChild { margin: 6px 0 0 12px; background: rgba(127,127,127,0.04); }
@@ -1580,6 +1875,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .msgActions { display: flex; gap: 8px; }
       .msgActionBtn { padding: 2px 8px; font-size: 12px; border-radius: 999px; }
       .msgMeta { margin-top: 8px; font-size: 11px; opacity: 0.65; white-space: pre-wrap; word-break: break-word; }
+      .actionCard { background: rgba(255, 185, 0, 0.10); }
+      .actionCardHeader { font-weight: 600; margin-bottom: 6px; }
+      .actionCardBody { opacity: 0.95; white-space: pre-wrap; }
+      .actionCardActions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+      .actionCardBtn.primary { background: rgba(0, 120, 212, 0.18); border-color: rgba(0,120,212,0.45); }
 
       /* inProgress: spinner */
       .statusIcon.status-inProgress::before { width: 14px; height: 14px; border: 2px solid rgba(180, 180, 180, 0.95); border-top-color: rgba(180, 180, 180, 0.15); border-radius: 50%; animation: cmSpin 0.9s linear infinite; margin: 1px; }
@@ -1626,7 +1926,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       textarea::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .suggest { position: absolute; left: 12px; right: 12px; bottom: calc(100% + 8px); border: 1px solid var(--vscode-editorSuggestWidget-border, rgba(127,127,127,0.35)); border-radius: 10px; background: var(--vscode-editorSuggestWidget-background, rgba(30,30,30,0.95)); color: var(--vscode-editorSuggestWidget-foreground, inherit); max-height: 160px; overflow: auto; display: none; z-index: 20; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
       button.iconBtn.attachBtn::before { content: "📎"; font-size: 14px; }
+      .requestUserInput { padding: 10px 12px; border-top: 1px solid rgba(127,127,127,0.25); border-bottom: 1px solid rgba(127,127,127,0.25); display: none; }
       .attachments { display: none; flex-wrap: wrap; gap: 8px; }
+      .runtimeActionRow { display: none; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .runtimeActionHint { font-size: 12px; opacity: 0.75; }
+      .runtimeActionBtn { padding: 4px 10px; border-radius: 999px; font-size: 12px; }
+      .runtimeActionBtn.primary { background: rgba(0, 120, 212, 0.18); border-color: rgba(0,120,212,0.45); }
       .attachmentChip { border: 1px solid rgba(127,127,127,0.35); border-radius: 10px; padding: 6px 8px; font-size: 12px; display: inline-flex; gap: 8px; align-items: center; max-width: 320px; }
       .attachmentThumb { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(127,127,127,0.25); background: rgba(0,0,0,0.02); flex: 0 0 auto; }
       .attachmentName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.9; }
@@ -1647,7 +1952,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       .autoUrlLink.modHover:hover { color: var(--vscode-textLink-activeForeground, rgba(0,120,212,1)); }
       .fileLink, .autoFileLink, .autoUrlLink { overflow-wrap: anywhere; word-break: break-word; }
 	      .fileDiff { margin-top: 8px; }
-      .askUserQuestion { padding: 10px 12px; border-top: 1px solid rgba(127,127,127,0.25); border-bottom: 1px solid rgba(127,127,127,0.25); display: none; }
       .askCard { border: 1px solid rgba(127,127,127,0.35); border-radius: 10px; padding: 10px 12px; background: rgba(0,0,0,0.03); }
       .askHeader { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; }
       .askTitle { font-weight: 600; }
@@ -1726,10 +2030,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
 	    <div id="log" class="log"></div>
       <div id="hydrateBanner" class="hydrateBanner" style="display:none"></div>
-		    <div id="composer" class="composer">
+	    <div id="composer" class="composer">
 	      <div id="editBanner" class="editBanner" style="display:none"></div>
-	      <div id="askUserQuestion" class="askUserQuestion"></div>
+	      <div id="requestUserInput" class="requestUserInput"></div>
 	      <div id="attachments" class="attachments"></div>
+        <div id="runtimeActionRow" class="runtimeActionRow">
+          <div class="runtimeActionHint">Turn running</div>
+          <button id="steerSend" class="runtimeActionBtn primary" title="Send to current running turn">Steer send</button>
+          <button id="queueSend" class="runtimeActionBtn" title="Queue for next turn">Queue next</button>
+        </div>
 	      <button id="returnToBottom" class="returnToBottomBtn" title="Scroll to bottom">Return to Bottom</button>
 	      <div id="inputRow" class="inputRow">
         <input id="imageInput" type="file" accept="image/*" multiple style="display:none" />

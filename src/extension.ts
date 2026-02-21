@@ -13,16 +13,24 @@ import { listAgentsFromDisk } from "./agents_disk";
 import type { AnyServerNotification } from "./backend/types";
 import type { ContentBlock } from "./generated/ContentBlock";
 import type { ImageContent } from "./generated/ImageContent";
-import type { AskUserQuestionRequest } from "./generated/AskUserQuestionRequest";
+import type { Personality } from "./generated/Personality";
 import type { CommandAction } from "./generated/v2/CommandAction";
 import type { Model } from "./generated/v2/Model";
+import type { SkillsListEntry } from "./generated/v2/SkillsListEntry";
+import type { SkillMetadata } from "./generated/v2/SkillMetadata";
+import type { AppInfo } from "./generated/v2/AppInfo";
+import type { RemoteSkillSummary } from "./generated/v2/RemoteSkillSummary";
+import type { ConfigReadResponse } from "./generated/v2/ConfigReadResponse";
 import type { RateLimitSnapshot } from "./generated/v2/RateLimitSnapshot";
 import type { RateLimitWindow } from "./generated/v2/RateLimitWindow";
-import type { AskUserQuestionResponse } from "./generated/v2/AskUserQuestionResponse";
 import type { Thread } from "./generated/v2/Thread";
 import type { ThreadItem } from "./generated/v2/ThreadItem";
+import type { ThreadSourceKind } from "./generated/v2/ThreadSourceKind";
 import type { ThreadTokenUsage } from "./generated/v2/ThreadTokenUsage";
 import type { Turn } from "./generated/v2/Turn";
+import type { UserInput } from "./generated/v2/UserInput";
+import type { CollaborationMode } from "./generated/CollaborationMode";
+import type { CollaborationModeMask } from "./generated/CollaborationModeMask";
 import type { BackendId, Session } from "./sessions";
 import { SessionStore } from "./sessions";
 import {
@@ -30,9 +38,27 @@ import {
   parseBackendInstanceKey,
 } from "./backend/backend_instance_key";
 import {
+  evaluateReloadSessionGuard,
+  evaluateReopenSessionAction,
+  parseReopenCommandArgs,
+  RELOAD_OTHER_SESSION_RUNNING_MESSAGE,
+  RELOAD_UNSUPPORTED_MESSAGE,
+} from "./commands/session_actions";
+import {
+  decideLoadHistoryPostHydrationAction,
+  decideSessionSelection,
+  shouldForceLoadHistoryForRewind,
+} from "./commands/session_selection";
+import {
+  nextPendingLocalUserBlockIdOnSend,
+  nextPendingLocalUserBlockIdOnTurnCompleted,
+  resolvePendingLocalUserBlockBinding,
+} from "./runtime/pending_local_user_block";
+import {
   ChatViewProvider,
   getSessionModelState,
   hasSessionModelState,
+  isSessionModelOverrideExplicit,
   setDefaultModelState,
   setSessionModelState,
   type ChatBlock,
@@ -69,6 +95,30 @@ type CachedImageMeta = {
   byteLength: number;
   createdAtMs: number;
 };
+
+type ActionCardState =
+  | {
+      kind: "personality";
+      actions: Map<string, { label: string; personality: Personality | null }>;
+    }
+  | { kind: "apps"; actions: Map<string, { app: AppInfo }> }
+  | { kind: "mcp"; actions: Map<string, { action: "refresh" }> }
+  | {
+      kind: "skills";
+      actions: Map<
+        string,
+        | { kind: "refresh" }
+        | { kind: "insert"; skill: SkillMetadata }
+        | { kind: "download"; remote: RemoteSkillSummary }
+      >;
+    }
+  | {
+      kind: "debugConfig";
+      actions: Map<
+        string,
+        { kind: "copyConfig" | "copyLayers"; payload: string }
+      >;
+    };
 
 const IMAGE_CACHE_DIRNAME = "images.v2";
 const IMAGE_CACHE_MAX_ITEMS = 500;
@@ -240,14 +290,22 @@ async function pruneImageCache(
   }
 
   items.sort((a, b) => b.createdAtMs - a.createdAtMs);
-  let totalBytes = items.reduce((sum, it) => sum + it.byteLength, 0);
 
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i]!;
-    const keepByCount = i < IMAGE_CACHE_MAX_ITEMS;
-    const keepByBytes = totalBytes <= IMAGE_CACHE_MAX_TOTAL_BYTES;
-    if (keepByCount && keepByBytes) continue;
-    totalBytes -= it.byteLength;
+  // Keep newest images. If over limits, delete oldest first (not newest).
+  let keep = items.slice(0, IMAGE_CACHE_MAX_ITEMS);
+  let keepBytes = keep.reduce((sum, it) => sum + it.byteLength, 0);
+
+  // If the kept set is still too large, drop from the end (oldest within keep).
+  // Keep at least 1 item to avoid immediately evicting the newest image view.
+  while (keep.length > 1 && keepBytes > IMAGE_CACHE_MAX_TOTAL_BYTES) {
+    const dropped = keep.pop();
+    if (!dropped) break;
+    keepBytes -= dropped.byteLength;
+  }
+
+  const keepKeys = new Set(keep.map((it) => it.imageKey));
+  for (const it of items) {
+    if (keepKeys.has(it.imageKey)) continue;
     await fs.rm(it.metaPath, { force: true }).catch(() => null);
     await fs.rm(it.dataPath, { force: true }).catch(() => null);
   }
@@ -352,6 +410,7 @@ async function loadCachedImageBase64(imageKey: string): Promise<{
 }
 
 const HIDDEN_TAB_SESSIONS_KEY = "codez.hiddenTabSessions.v1";
+const TAB_ORDER_KEY = "codez.tabOrder.v1";
 const WORKSPACE_COLOR_OVERRIDES_KEY = "codez.workspaceColorOverrides.v1";
 const LEGACY_RUNTIMES_KEY = "codez.sessionRuntime.v1";
 const hiddenTabSessionIds = new Set<string>();
@@ -371,9 +430,22 @@ const WORKSPACE_COLOR_PALETTE = [
   "#c9d1d9", // グレー
 ] as const;
 let workspaceColorOverrides: Record<string, number> = {};
+type TabOrderState = {
+  workspaceOrder: string[];
+  sessionOrderByWorkspace: Record<string, string[]>;
+};
+let tabOrder: TabOrderState = {
+  workspaceOrder: [],
+  sessionOrderByWorkspace: {},
+};
 const mcpStatusByBackendKey = new Map<string, Map<string, string>>();
 const defaultTitleRe = /^(.*)\s+\([0-9a-f]{8}\)$/i;
 type UiImageInput = { name: string; url: string };
+type QueuedUserInput = {
+  text: string;
+  images: UiImageInput[];
+  modelState: ModelState | null;
+};
 type BackendImageInput =
   | { kind: "imageUrl"; url: string }
   | { kind: "localImage"; path: string };
@@ -396,6 +468,7 @@ type SessionRuntime = {
   reloading: boolean;
   compactInFlight: boolean;
   pendingCompactBlockId: string | null;
+  clearUiHistoryAfterCompact: boolean;
   pendingAssistantDeltas: Map<string, string>;
   pendingAssistantMetaById: Map<string, string>;
   pendingAssistantDeltaFlushTimer: NodeJS.Timeout | null;
@@ -426,6 +499,11 @@ type SessionRuntime = {
     string,
     (decision: "accept" | "acceptForSession" | "decline" | "cancel") => void
   >;
+  pendingAppMentions: Array<{ name: string; path: string }>;
+  pendingUserInputQueue: QueuedUserInput[];
+  pendingLocalUserBlockId: string | null;
+  flushingQueuedUserInput: boolean;
+  actionCards: Map<string, ActionCardState>;
 };
 
 const runtimeBySessionId = new Map<string, SessionRuntime>();
@@ -437,7 +515,17 @@ let globalStatusText: string | null = null;
 let globalRateLimitStatusText: string | null = null;
 let globalRateLimitStatusTooltip: string | null = null;
 let customPrompts: CustomPromptSummary[] = [];
+let customPromptWatchers: vscode.FileSystemWatcher[] = [];
+let customPromptWatcherKey: string | null = null;
+let customPromptRefreshTimer: NodeJS.Timeout | null = null;
 const pendingModelFetchByBackend = new Map<string, Promise<void>>();
+const pendingCollaborationFetchByBackend = new Map<string, Promise<void>>();
+const configByBackendKey = new Map<string, ConfigReadResponse>();
+const pendingConfigFetchByBackend = new Map<string, Promise<void>>();
+const collaborationPresetsByBackend = new Map<
+  string,
+  CollaborationModeMask[]
+>();
 const PROMPTS_CMD_PREFIX = "prompts";
 const loggedAgentScanErrors = new Set<string>();
 const UNHANDLED_DEBUG_MAX_CHARS = 100_000;
@@ -470,19 +558,20 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       void vscode.window
         .showInformationMessage(
-          "保存済みセッションの形式が更新されました。移行コマンドを実行すると、旧形式（v1）のセッションを codex/codez/opencode のいずれかに割り当てて復元できます。",
-          "移行する",
+          "Saved session format has been updated. Run the migration command to restore legacy (v1) sessions and assign them to codex/codez/opencode.",
+          "Migrate",
         )
         .then((picked) => {
-          if (picked === "移行する") {
+          if (picked === "Migrate") {
             void vscode.commands.executeCommand("codez.migrateSessionsV1");
           }
         });
     }
   }
   loadHiddenTabSessions(context);
+  tabOrder = loadTabOrder(context);
   workspaceColorOverrides = loadWorkspaceColorOverrides(context);
-  refreshCustomPromptsFromDisk();
+  refreshCustomPromptsFromDisk(null);
   void cleanupLegacyRuntimeCache(context);
 
   backendManager = new BackendManager(output, sessions);
@@ -496,7 +585,6 @@ export function activate(context: vscode.ExtensionContext): void {
     saveSessions(context, sessions!);
     sessionTree?.refresh();
     setActiveSession(s.id);
-    refreshCustomPromptsFromDisk();
     void ensureModelsFetched(s);
     void showCodezViewContainer();
   };
@@ -544,93 +632,9 @@ export function activate(context: vscode.ExtensionContext): void {
       rt.approvalResolvers.set(requestKey, resolve);
     });
   };
-  backendManager.onAskUserQuestionRequest = async (session, req) => {
-    if (!chatView) throw new Error("chatView is not initialized");
-    if (!session || typeof session.id !== "string") {
-      throw new Error("AskUserQuestion requires a valid session");
-    }
-
-    const params = (req as any).params as any;
-    const callId = typeof params?.callId === "string" ? params.callId : null;
-    const request = params?.request;
-    if (!callId) throw new Error("AskUserQuestion missing callId");
-    if (!request || typeof request !== "object") {
-      throw new Error("AskUserQuestion missing request payload");
-    }
-
-    // Switch UI context to the requesting session so the prompt is visible.
-    setActiveSession(session.id, { markRead: false });
-    chatView.refresh();
-    await showCodezViewContainer();
-    // Ensure the webview is actually instantiated and visible.
-    await vscode.commands.executeCommand("codez.chatView.focus");
-    chatView.reveal();
-
-    const response = await chatView.promptAskUserQuestion({
-      requestKey: callId,
-      request: request as AskUserQuestionRequest,
-    });
-
-    // Persist a concise summary in the chat history so the selection isn't lost
-    // after the inline card is dismissed.
-    const summaryText = formatAskUserQuestionSummary(
-      request as AskUserQuestionRequest,
-      response,
-    );
-    upsertBlock(session.id, {
-      id: `askUserQuestion:${callId}`,
-      type: "info",
-      title: "AskUserQuestion",
-      text: summaryText,
-    });
-
-    return response;
-  };
 
   diffProvider = new DiffDocumentProvider();
 
-  // NOTE: This is intentionally not contributed to the command palette in package.json.
-  // It's a helper for local/dev workflows (e.g. taking docs screenshots) without requiring
-  // an actual backend request.
-  context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "codez._dev.askUserQuestionDemo",
-      async () => {
-        if (!chatView) throw new Error("chatView is not initialized");
-        await showCodezViewContainer();
-        await vscode.commands.executeCommand("codez.chatView.focus");
-        chatView.reveal();
-
-        const response = await chatView.promptAskUserQuestion({
-          requestKey: `demo:${Date.now()}`,
-          request: {
-            title: "Codex question",
-            questions: [
-              {
-                id: "context",
-                prompt: "Which context should I include?",
-                type: "multi_select",
-                allowOther: true,
-                required: false,
-                options: [
-                  {
-                    label: "Workspace files",
-                    value: "files",
-                    recommended: true,
-                  },
-                  { label: "Open editors", value: "editors" },
-                  { label: "Terminal output", value: "terminal" },
-                ],
-              },
-            ],
-          },
-        });
-        void vscode.window.showInformationMessage(
-          `AskUserQuestion demo result: ${JSON.stringify(response)}`,
-        );
-      },
-    ),
-  );
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
       "codez-diff",
@@ -643,6 +647,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.extensionUri,
     sessions,
     (workspaceFolderUri) => colorIndexForWorkspaceFolderUri(workspaceFolderUri),
+    () => listAllSessionsOrdered(sessions!),
   );
   context.subscriptions.push(sessionTree);
   context.subscriptions.push(
@@ -651,154 +656,253 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  chatView = new ChatViewProvider(
-    context,
-    () => buildChatState(),
-    async (text, images = [], rewind = null) => {
-      if (!backendManager) throw new Error("backendManager is not initialized");
-      if (!sessions) throw new Error("sessions is not initialized");
-      const bm = backendManager;
+  const handleChatSend = async (
+    text: string,
+    images: UiImageInput[] = [],
+    rewind: { turnId: string; turnIndex?: number } | null = null,
+    opts?: { queueIfBusy?: boolean },
+  ): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    if (!sessions) throw new Error("sessions is not initialized");
+    const bm = backendManager;
 
-      const session = activeSessionId
-        ? sessions.getById(activeSessionId)
-        : null;
-      if (!session) {
-        void vscode.window.showErrorMessage("No session selected.");
-        return;
-      }
+    const session = activeSessionId ? sessions.getById(activeSessionId) : null;
+    if (!session) {
+      void vscode.window.showErrorMessage("No session selected.");
+      return;
+    }
 
-      const trimmed = text.trim();
-      if (rewind && trimmed.startsWith("/")) {
+    const trimmed = text.trim();
+    if (rewind && trimmed.startsWith("/")) {
+      void vscode.window.showErrorMessage(
+        "Rewind is not supported for slash commands.",
+      );
+      return;
+    }
+    if (trimmed.startsWith("/") && images.length > 0) {
+      void vscode.window.showErrorMessage(
+        "Slash commands do not support images yet.",
+      );
+      return;
+    }
+
+    const rt = ensureRuntime(session.id);
+    if (opts?.queueIfBusy && rt.sending) {
+      if (!trimmed && images.length === 0) return;
+      if (rewind) {
         void vscode.window.showErrorMessage(
-          "Rewind is not supported for slash commands.",
-        );
-        return;
-      }
-      if (trimmed.startsWith("/") && images.length > 0) {
-        void vscode.window.showErrorMessage(
-          "Slash commands do not support images yet.",
+          "Rewind is not supported for queued input.",
         );
         return;
       }
       if (trimmed.startsWith("/")) {
-        const slashHandled = await handleSlashCommand(context, session, text);
-        if (slashHandled) return;
+        void vscode.window.showErrorMessage(
+          "Slash commands cannot be queued while a turn is in progress.",
+        );
+        return;
       }
+      rt.pendingUserInputQueue.push({
+        text,
+        images,
+        modelState: getSessionModelState(session.id),
+      });
+      chatView?.toast(
+        "info",
+        `Queued message (${rt.pendingUserInputQueue.length})`,
+      );
+      chatView?.refresh();
+      return;
+    }
 
-      const expanded = await expandMentions(session, text);
-      if (!expanded.ok) {
-        void vscode.window.showErrorMessage(expanded.error);
+    if (trimmed.startsWith("/")) {
+      const slashHandled = await handleSlashCommand(context, session, text);
+      if (slashHandled) return;
+    }
+
+    const expanded = await expandMentions(session, text);
+    if (!expanded.ok) {
+      void vscode.window.showErrorMessage(expanded.error);
+      return;
+    }
+
+    if (rewind) {
+      const folder = resolveWorkspaceFolderForSession(session);
+      if (!folder) {
+        void vscode.window.showErrorMessage(
+          "WorkspaceFolder not found for session.",
+        );
+        return;
+      }
+      if (session.backendId !== "codez" && session.backendId !== "opencode") {
+        void vscode.window.showInformationMessage(
+          "Rewind is supported for codez/opencode sessions only.",
+        );
         return;
       }
 
-      if (rewind) {
-        const folder = resolveWorkspaceFolderForSession(session);
-        if (!folder) {
-          void vscode.window.showErrorMessage(
-            "WorkspaceFolder not found for session.",
-          );
-          return;
-        }
-        if (session.backendId !== "codez" && session.backendId !== "opencode") {
-          void vscode.window.showInformationMessage(
-            "Rewind は codez または opencode セッションでのみ対応です。",
-          );
-          return;
-        }
+      const turnIdRaw = (rewind as any).turnId;
+      const turnId = typeof turnIdRaw === "string" ? turnIdRaw.trim() : "";
+      if (!turnId) {
+        void vscode.window.showErrorMessage("Invalid rewind request.");
+        return;
+      }
+      const turnIndexRaw = (rewind as any).turnIndex;
+      const turnIndex =
+        typeof turnIndexRaw === "number" && Number.isFinite(turnIndexRaw)
+          ? Math.trunc(turnIndexRaw)
+          : null;
+      const rewindLabel =
+        turnIndex && turnIndex >= 1 ? `turn #${turnIndex}` : `turnId=${turnId}`;
 
-        const turnIndexRaw = (rewind as any).turnIndex;
-        const turnIndex =
-          typeof turnIndexRaw === "number" && Number.isFinite(turnIndexRaw)
-            ? Math.trunc(turnIndexRaw)
-            : 0;
-
-        if (!turnIndex || turnIndex < 1) {
-          void vscode.window.showErrorMessage("Invalid rewind request.");
-          return;
-        }
-
-        const rt = ensureRuntime(session.id);
-        if (rt.sending) {
-          void vscode.window.showErrorMessage(
-            "Cannot rewind while a turn is in progress.",
-          );
-          return;
-        }
-        if (session.backendId === "opencode" && bm.isOpencodeSessionBusy(session)) {
-          void vscode.window.showErrorMessage(
-            "OpenCode セッションが busy のため Rewind できません。Stop してからやり直してください。",
-          );
-          return;
-        }
-
-        const rewindBlockId = newLocalId("info");
-
-        const runRewind = async (): Promise<void> => {
-          upsertBlock(session.id, {
-            id: rewindBlockId,
-            type: "info",
-            title: "Rewind requested",
-            text: `Rewinding to turn #${turnIndex}…`,
-          });
-          chatView?.refresh();
-
-          const resumed = await withTimeout(
-            "thread/resume",
-            bm.resumeSession(session),
-            REWIND_STEP_TIMEOUT_MS,
-          );
-          const totalTurns = Array.isArray(resumed.thread.turns)
-            ? resumed.thread.turns.length
-            : 0;
-          const numTurns = totalTurns - (turnIndex - 1);
-          if (!Number.isFinite(numTurns) || numTurns < 1) {
-            throw new Error(
-              `Invalid rewind request: turnIndex=${turnIndex} totalTurns=${totalTurns}`,
-            );
-          }
-
-          const rolledBack = await withTimeout(
-            "thread/rollback",
-            bm.threadRollback(session, { numTurns }),
-            REWIND_STEP_TIMEOUT_MS,
-          );
-          hydrateRuntimeFromThread(session.id, rolledBack.thread, {
-            force: true,
-          });
-
-          upsertBlock(session.id, {
-            id: rewindBlockId,
-            type: "info",
-            title: "Rewind completed",
-            text: `Rewound to turn #${turnIndex}.`,
-          });
-          chatView?.refresh();
-        };
-
-        try {
-          await runRewind();
-        } catch (err) {
-          const errText = formatUnknownError(err);
-          outputChannel?.appendLine(
-            `[rewind] Failed: threadId=${session.threadId} turnIndex=${turnIndex} err=${errText}`,
-          );
-          upsertBlock(session.id, {
-            id: rewindBlockId,
-            type: "error",
-            title: "Rewind failed",
-            text: `${errText}\n\nCheck 'Codex UI' output channel for backend logs.`,
-          });
-          chatView?.refresh();
-          return;
-        }
+      if (rt.sending) {
+        void vscode.window.showErrorMessage(
+          "Cannot rewind while a turn is in progress.",
+        );
+        return;
+      }
+      if (session.backendId === "opencode" && bm.isOpencodeSessionBusy(session)) {
+        void vscode.window.showErrorMessage(
+          "Cannot rewind because the OpenCode session is busy. Stop it and try again.",
+        );
+        return;
       }
 
-      await sendUserInput(
+      const rewindBlockId = newLocalId("info");
+
+      const runRewind = async (): Promise<void> => {
+        upsertBlock(session.id, {
+          id: rewindBlockId,
+          type: "info",
+          title: "Rewind requested",
+          text: `Rewinding to ${rewindLabel}…`,
+        });
+        chatView?.refresh();
+
+        const rolledBack = await withTimeout(
+          "thread/rollback",
+          bm.threadRollback(session, { turnId }),
+          REWIND_STEP_TIMEOUT_MS,
+        );
+        hydrateRuntimeFromThread(session.id, rolledBack.thread, {
+          force: true,
+        });
+
+        upsertBlock(session.id, {
+          id: rewindBlockId,
+          type: "info",
+          title: "Rewind completed",
+          text: `Rewound to ${rewindLabel}.`,
+        });
+        chatView?.refresh();
+      };
+
+      try {
+        await runRewind();
+      } catch (err) {
+        const errText = formatUnknownError(err);
+        outputChannel?.appendLine(
+          `[rewind] Failed: threadId=${session.threadId} turnId=${turnId} err=${errText}`,
+        );
+        upsertBlock(session.id, {
+          id: rewindBlockId,
+          type: "error",
+          title: "Rewind failed",
+          text: `${errText}\n\nCheck 'Codex UI' output channel for backend logs.`,
+        });
+        chatView?.refresh();
+        return;
+      }
+    }
+
+    await sendUserInput(
+      session,
+      expanded.text,
+      images,
+      getSessionModelState(session.id),
+    );
+  };
+
+  const handleChatSteer = async (
+    text: string,
+    rewind: { turnId: string; turnIndex?: number } | null = null,
+  ): Promise<void> => {
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    if (!sessions) throw new Error("sessions is not initialized");
+
+    const sessionMaybe = activeSessionId
+      ? sessions.getById(activeSessionId)
+      : null;
+    if (!sessionMaybe) {
+      throw new Error("No session selected.");
+    }
+    const session: Session = sessionMaybe;
+    if (session.backendId === "opencode") {
+      throw new Error("Steer is not supported for opencode sessions.");
+    }
+    if (rewind) {
+      throw new Error("Rewind cannot be used with steer send.");
+    }
+
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (trimmed.startsWith("/")) {
+      throw new Error("Slash commands cannot be sent as steer input.");
+    }
+
+    const rt = ensureRuntime(session.id);
+    if (!rt.sending) {
+      throw new Error("No running turn to steer. Start a turn first.");
+    }
+    const activeTurnId =
+      rt.activeTurnId ?? backendManager.getActiveTurnId(session.threadId);
+    if (!activeTurnId) {
+      throw new Error("Cannot steer because active turn id is not available.");
+    }
+
+    const expanded = await expandMentions(session, text);
+    if (!expanded.ok) {
+      throw new Error(expanded.error);
+    }
+    const expandedText = expanded.text;
+
+    await steerUserInput(session, expandedText, activeTurnId);
+  };
+
+  chatView = new ChatViewProvider(
+    context,
+    () => buildChatState(),
+    async (text, images = [], rewind = null) =>
+      await handleChatSend(text, images, rewind, { queueIfBusy: false }),
+    async (text, images = [], rewind = null) =>
+      await handleChatSend(text, images, rewind, { queueIfBusy: true }),
+    async (text, rewind = null) => await handleChatSteer(text, rewind),
+    async (session, args) => {
+      if (!backendManager) throw new Error("backendManager is not initialized");
+      const requestID = String(args.requestID ?? "").trim();
+      const reply = args.reply;
+      if (!requestID) throw new Error("Missing requestID");
+      if (reply !== "once" && reply !== "always" && reply !== "reject") {
+        throw new Error(`Invalid reply: ${String(reply)}`);
+      }
+      await backendManager.replyOpencodePermission({
         session,
-        expanded.text,
-        images,
-        getSessionModelState(session.id),
-      );
+        requestID,
+        reply,
+      });
+      const rt = ensureRuntime(session.id);
+      const id = `opencodePermission:${requestID}`;
+      const idx = rt.blockIndexById.get(id);
+      if (idx !== undefined) {
+        const b = rt.blocks[idx];
+        if (b && (b as any).type === "opencodePermission") {
+          (b as any).status = "replied";
+          (b as any).reply = reply;
+          (b as any).error = null;
+          chatView?.postBlockUpsert(session.id, b as any);
+          chatView?.refresh();
+          schedulePersistRuntime(session.id);
+        }
+      }
     },
     async (session) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -871,19 +975,31 @@ export function activate(context: vscode.ExtensionContext): void {
       return res.files.map((f) => String(f.path || "").replace(/\\\\/g, "/"));
     },
     async (sessionId) => {
+      if (!backendManager) throw new Error("backendManager is not initialized");
       if (!sessions) throw new Error("sessions is not initialized");
       const session = sessions.getById(sessionId);
       if (!session) throw new Error(`Session not found: ${sessionId}`);
-      const folder = resolveWorkspaceFolderForSession(session);
-      if (!folder)
-        throw new Error(`WorkspaceFolder not found for session: ${sessionId}`);
+
+      if (session.backendId === "opencode") {
+        const agents = await backendManager.listAgentsForSession(session);
+        return agents
+          .map((a) => String(a.name || "").trim())
+          .filter((name) => name.length > 0);
+      }
 
       if (session.backendId !== "codez") return [];
 
+      const folder = resolveWorkspaceFolderForSession(session);
+      if (!folder)
+        throw new Error(`WorkspaceFolder not found for session: ${sessionId}`);
       const { agents } = await listAgentsFromDisk(folder.uri.fsPath);
       return agents
         .map((a) => String(a.name || "").trim())
         .filter((name) => name.length > 0);
+    },
+    async (session) => {
+      if (!backendManager) throw new Error("backendManager is not initialized");
+      return await backendManager.listAgentsForSession(session);
     },
     async (sessionId) => {
       if (!backendManager) throw new Error("backendManager is not initialized");
@@ -900,6 +1016,9 @@ export function activate(context: vscode.ExtensionContext): void {
         scope: s.scope,
         path: s.path,
       }));
+    },
+    async (args) => {
+      await handleActionCardAction(args);
     },
     async (imageKey) => {
       return await loadCachedImageBase64(imageKey);
@@ -936,6 +1055,8 @@ export function activate(context: vscode.ExtensionContext): void {
       schedulePersistRuntime(session.id);
     },
   );
+  backendManager.onRequestUserInput = async (session, req) =>
+    await handleRequestUserInputInChat(session, req);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       ChatViewProvider.viewType,
@@ -961,12 +1082,10 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       // Ensure the view is visible so the user sees the restored conversation.
       await showCodezViewContainer();
-      setActiveSession(session.id, { markRead: false });
+      setActiveSession(session.id);
       const res = await backendManager.resumeSession(session);
       void ensureModelsFetched(session);
       hydrateRuntimeFromThread(session.id, res.thread);
-      setActiveSession(session.id);
-      refreshCustomPromptsFromDisk();
     } catch (err) {
       output.appendLine(
         `[startup] Failed to restore last sessionId=${lastSessionId}: ${String(err)}`,
@@ -994,8 +1113,8 @@ export function activate(context: vscode.ExtensionContext): void {
           };
         }),
         {
-          title: "バックエンドを起動",
-          placeHolder: "起動するバックエンドを選択してください（複数選択可）",
+          title: "Start backend(s)",
+          placeHolder: "Select backends to start (multi-select)",
           canPickMany: true,
         },
       );
@@ -1051,7 +1170,7 @@ export function activate(context: vscode.ExtensionContext): void {
             : "";
         if (!workspaceFolderUri) {
           void vscode.window.showErrorMessage(
-            "workspaceFolderUri が不正です。",
+            "Invalid workspaceFolderUri.",
           );
           return;
         }
@@ -1069,35 +1188,35 @@ export function activate(context: vscode.ExtensionContext): void {
           idx: number | null;
         }> = [
           {
-            label: "自動",
-            description: "ハッシュから自動で色を割り当て",
+            label: "Auto",
+            description: "Assign a color automatically (hash)",
             idx: null,
           },
           ...WORKSPACE_COLOR_PALETTE.map((hex, idx) => {
             const name =
               idx === 0
-                ? "青"
+                ? "Blue"
                 : idx === 1
-                  ? "緑"
+                  ? "Green"
                   : idx === 2
-                    ? "黄"
+                    ? "Yellow"
                     : idx === 3
-                      ? "オレンジ"
+                      ? "Orange"
                       : idx === 4
-                        ? "赤"
+                        ? "Red"
                         : idx === 5
-                          ? "紫"
+                          ? "Purple"
                           : idx === 6
-                            ? "ピンク"
+                            ? "Pink"
                             : idx === 7
-                              ? "ミント"
+                              ? "Mint"
                               : idx === 8
-                                ? "アプリコット"
+                                ? "Apricot"
                                 : idx === 9
-                                  ? "水色"
+                                  ? "Light blue"
                                   : idx === 10
-                                    ? "ラベンダー"
-                                    : "グレー";
+                                    ? "Lavender"
+                                    : "Gray";
             return {
               label: name,
               description: String(hex),
@@ -1107,7 +1226,7 @@ export function activate(context: vscode.ExtensionContext): void {
         ];
 
         const picked = await vscode.window.showQuickPick(items, {
-          title: "プロジェクト色を選択",
+          title: "Pick workspace color",
           placeHolder,
         });
         if (!picked) return;
@@ -1170,7 +1289,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const session = await backendManager.newSession(
           folder,
           backendId,
-          getSessionModelState(null),
+          undefined,
         );
         setActiveSession(session.id);
         void ensureModelsFetched(session);
@@ -1187,7 +1306,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const legacy = readPersistedSessionsV1(extensionContext);
       if (legacy.length === 0) {
         void vscode.window.showInformationMessage(
-          "移行対象の v1 セッションが見つかりませんでした。",
+          "No legacy v1 sessions found to migrate.",
         );
         return;
       }
@@ -1218,15 +1337,15 @@ export function activate(context: vscode.ExtensionContext): void {
             backendId,
           })),
           {
-            label: "(このフォルダはスキップ)",
+            label: "(Skip this folder)",
             description: "",
             backendId: null,
           },
         ];
         const picked = await vscode.window.showQuickPick(items, {
-          title: `セッション移行: ${folderLabel}`,
+          title: `Migrate sessions: ${folderLabel}`,
           placeHolder:
-            "このフォルダの旧セッションをどのバックエンド群に割り当てますか？",
+            "Which backend should legacy sessions in this folder be assigned to?",
         });
         if (!picked || !picked.backendId) {
           skippedFolders.push(folderLabel);
@@ -1247,6 +1366,8 @@ export function activate(context: vscode.ExtensionContext): void {
             title: s.title,
             threadId: s.threadId,
             customTitle: s.customTitle ?? false,
+            personality: null,
+            collaborationModePresetName: null,
           });
         }
       }
@@ -1269,8 +1390,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (dedupedMigrated.length === 0) {
         void vscode.window.showInformationMessage(
           skipped > 0
-            ? "移行対象がすべて既存セッションと重複していたため、追加の移行は行いませんでした。"
-            : "移行対象がありませんでした。",
+            ? "All sessions to migrate were duplicates; nothing was added."
+            : "Nothing to migrate.",
         );
         return;
       }
@@ -1292,11 +1413,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const skippedText =
         skippedFolders.length > 0
-          ? `（スキップ: ${skippedFolders.length}フォルダ）`
+          ? ` (skipped: ${skippedFolders.length} folders)`
           : "";
-      const dedupeText = skipped > 0 ? `（重複でスキップ: ${skipped}件）` : "";
+      const dedupeText = skipped > 0 ? ` (deduped: ${skipped} duplicates)` : "";
       void vscode.window.showInformationMessage(
-        `移行完了: ${dedupedMigrated.length}件${skippedText}${dedupeText}`,
+        `Migration completed: ${dedupedMigrated.length} added${skippedText}${dedupeText}`,
       );
     }),
   );
@@ -1314,6 +1435,78 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!backendId) return;
       const wantedCwd = normalizeFsPathForCompare(folder.uri.fsPath);
 
+      let archived: boolean | null = null;
+      let sortKey: "created_at" | "updated_at" | null = null;
+      let sourceKinds: ThreadSourceKind[] | null = null;
+
+      if (backendId !== "opencode") {
+        const archivedPicked = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Active",
+              description: "Not archived",
+              archived: null as boolean | null,
+            },
+            {
+              label: "Archived",
+              description: "Archived only",
+              archived: true as const,
+            },
+          ],
+          { title: "History: Archived filter" },
+        );
+        if (!archivedPicked) return;
+        archived = archivedPicked.archived;
+
+        const sortPicked = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Updated",
+              description: "Sort by updated_at",
+              sortKey: "updated_at" as const,
+            },
+            {
+              label: "Created",
+              description: "Sort by created_at",
+              sortKey: "created_at" as const,
+            },
+          ],
+          { title: "History: Sort" },
+        );
+        if (!sortPicked) return;
+        sortKey = sortPicked.sortKey;
+
+        const allSourceKinds: ThreadSourceKind[] = [
+          "cli",
+          "vscode",
+          "exec",
+          "appServer",
+          "subAgent",
+          "subAgentReview",
+          "subAgentCompact",
+          "subAgentThreadSpawn",
+          "subAgentOther",
+          "unknown",
+        ];
+        const sourcePicked = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Interactive only",
+              description: "CLI / VSCode threads (default server behavior)",
+              sourceKinds: null as ThreadSourceKind[] | null,
+            },
+            {
+              label: "All sources",
+              description: "Include exec / app-server / sub-agents, etc.",
+              sourceKinds: allSourceKinds,
+            },
+          ],
+          { title: "History: Source filter" },
+        );
+        if (!sourcePicked) return;
+        sourceKinds = sourcePicked.sourceKinds;
+      }
+
       let cursor: string | null = null;
       const collected: Thread[] = [];
 
@@ -1327,6 +1520,9 @@ export function activate(context: vscode.ExtensionContext): void {
               cursor,
               limit: 50,
               modelProviders: null,
+              sortKey,
+              sourceKinds,
+              archived,
             },
           );
         } catch (err) {
@@ -1341,7 +1537,7 @@ export function activate(context: vscode.ExtensionContext): void {
         collected.push(...filtered);
 
         const items = collected.map((t) => ({
-          label: `${formatThreadWhen(t.createdAt)}  ${formatThreadLabel(t.preview)}`,
+          label: `${formatThreadWhen(sortKey === "created_at" ? t.createdAt : t.updatedAt)}  ${formatThreadLabel(t.preview)}`,
           thread: t,
           kind: "thread" as const,
         }));
@@ -1377,6 +1573,23 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         const thread = (picked as any).thread as Thread;
+        if (backendId !== "opencode" && archived === true) {
+          try {
+            await backendManager.unarchiveThreadForWorkspaceFolderAndBackendId(
+              folder,
+              backendId,
+              thread.id,
+            );
+          } catch (err) {
+            output.appendLine(
+              `[resume] Failed to unarchive threadId=${thread.id}: ${String(err)}`,
+            );
+            void vscode.window.showErrorMessage(
+              "Failed to unarchive the selected thread.",
+            );
+            return;
+          }
+        }
         const session: Session = {
           id: crypto.randomUUID(),
           backendId,
@@ -1384,6 +1597,8 @@ export function activate(context: vscode.ExtensionContext): void {
           workspaceFolderUri: folder.uri.toString(),
           title: normalizeSessionTitle(thread.preview || "Resumed"),
           threadId: thread.id,
+          personality: null,
+          collaborationModePresetName: null,
         };
 
         sessions.add(session.backendKey, session);
@@ -1397,7 +1612,6 @@ export function activate(context: vscode.ExtensionContext): void {
         void ensureModelsFetched(session);
         hydrateRuntimeFromThread(session.id, resumed.thread);
         setActiveSession(session.id);
-        refreshCustomPromptsFromDisk();
         await showCodezViewContainer();
         return;
       }
@@ -1413,39 +1627,29 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!sessions) throw new Error("sessions is not initialized");
         if (!extensionContext) throw new Error("extensionContext is not set");
 
-        if (typeof args !== "object" || args === null) return;
-        const anyArgs = args as Record<string, unknown>;
-        const sessionId = anyArgs["sessionId"];
-        const backendId = anyArgs["backendId"];
-        if (typeof sessionId !== "string" || !sessionId) return;
-        if (
-          backendId !== "codex" &&
-          backendId !== "codez" &&
-          backendId !== "opencode"
-        )
-          return;
+        const parsed = parseReopenCommandArgs(args);
+        if (!parsed) return;
+        const { sessionId, backendId } = parsed;
 
         const src = sessions.getById(sessionId);
         if (!src) return;
-
-        if (
-          src.backendId === "opencode" ||
-          backendId === "opencode" ||
-          (src.backendId !== "codex" && src.backendId !== "codez") ||
-          (backendId !== "codex" && backendId !== "codez")
-        ) {
-          void vscode.window.showErrorMessage(
-            "このスレッドは opencode と相互に互換がないため、codex/codez ↔ opencode の開き直しはできません。",
-          );
-          return;
-        }
 
         const backendKey = makeBackendInstanceKey(
           src.workspaceFolderUri,
           backendId,
         );
         const existing = sessions.getByThreadId(backendKey, src.threadId);
-        if (existing) {
+        const reopenAction = evaluateReopenSessionAction({
+          sourceBackendId: src.backendId,
+          targetBackendId: backendId,
+          existingSessionId: existing?.id ?? null,
+        });
+        if (!reopenAction.ok) {
+          void vscode.window.showErrorMessage(reopenAction.message);
+          return;
+        }
+
+        if (reopenAction.action === "reuseExisting" && existing) {
           setActiveSession(existing.id);
           await showCodezViewContainer();
           return;
@@ -1462,6 +1666,8 @@ export function activate(context: vscode.ExtensionContext): void {
           title,
           customTitle: true,
           threadId: src.threadId,
+          personality: src.personality ?? null,
+          collaborationModePresetName: src.collaborationModePresetName ?? null,
         };
 
         sessions.add(session.backendKey, session);
@@ -1474,7 +1680,6 @@ export function activate(context: vscode.ExtensionContext): void {
           void ensureModelsFetched(session);
           hydrateRuntimeFromThread(session.id, resumed.thread);
           setActiveSession(session.id);
-          refreshCustomPromptsFromDisk();
           await showCodezViewContainer();
         } catch (err) {
           output.appendLine(`[resume] Failed to reopen thread: ${String(err)}`);
@@ -1550,29 +1755,44 @@ export function activate(context: vscode.ExtensionContext): void {
         : null;
       if (!session) return;
 
-      if (session.backendId !== "codez") {
-        void vscode.window.showInformationMessage(
-          "Reload は codez セッションのみ対応です。",
-        );
-        chatView?.toast("info", "Reload は codez セッションのみ対応です。");
-        return;
-      }
-
       const folder = resolveWorkspaceFolderForSession(session);
-      if (!folder) {
-        void vscode.window.showErrorMessage(
-          "WorkspaceFolder not found for session.",
-        );
-        return;
-      }
       const rt = ensureRuntime(session.id);
-      if (rt.sending) {
-        void vscode.window.showErrorMessage(
-          "Cannot reload while a turn is in progress.",
-        );
+      const hasOtherRunningSession = [...runtimeBySessionId.entries()].some(
+        ([sid, r]) =>
+          sid !== session.id &&
+          (r.sending ||
+            r.activeTurnId !== null ||
+            r.streamingAssistantItemIds.size > 0 ||
+            r.pendingApprovals.size > 0),
+      );
+      const guard = evaluateReloadSessionGuard({
+        backendId: session.backendId,
+        hasWorkspaceFolder: Boolean(folder),
+        sending: rt.sending,
+        reloading: rt.reloading,
+        hasOtherRunningSession,
+      });
+      if (!guard.ok) {
+        if (guard.kind === "info" && guard.message) {
+          void vscode.window.showInformationMessage(guard.message);
+          if (guard.message === RELOAD_UNSUPPORTED_MESSAGE) {
+            chatView?.toast("info", guard.message);
+          }
+        }
+        if (guard.kind === "error" && guard.message) {
+          void vscode.window.showErrorMessage(guard.message);
+          if (guard.message === RELOAD_OTHER_SESSION_RUNNING_MESSAGE) {
+            chatView?.toast(
+              "info",
+              "Another session is running. Stop it and try again.",
+            );
+          }
+        }
         return;
       }
-      if (rt.reloading) return;
+      if (!folder) {
+        throw new Error("reload guard passed unexpectedly without folder");
+      }
       rt.reloading = true;
       rt.uiHydrationBlockedText = null;
       chatView?.refresh();
@@ -1889,7 +2109,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       if (session.backendId !== "codez") {
         void vscode.window.showInformationMessage(
-          "アカウントの作成/切り替えは codez セッションのみ対応です。",
+          "Account creation/switching is supported for codez sessions only.",
         );
         return;
       }
@@ -1988,45 +2208,77 @@ export function activate(context: vscode.ExtensionContext): void {
           void vscode.window.showErrorMessage("No session selected.");
           return;
         }
+        await showSkillsActionCard(session);
+      },
+    ),
+  );
 
-        let entries;
-        try {
-          entries = await backendManager.listSkillsForSession(session);
-        } catch (err) {
-          output.appendLine(`[skills] Failed to list skills: ${String(err)}`);
-          void vscode.window.showErrorMessage("Failed to list skills.");
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codez.cycleCollaborationMode",
+      async (args?: unknown) => {
+        if (!backendManager)
+          throw new Error("backendManager is not initialized");
+        if (!sessions) throw new Error("sessions is not initialized");
+        if (!extensionContext) throw new Error("extensionContext is not set");
+
+        const session =
+          parseSessionArg(args, sessions) ??
+          (activeSessionId ? sessions.getById(activeSessionId) : null);
+        if (!session) return;
+        if (session.backendId === "opencode") {
+          chatView?.toast(
+            "info",
+            "Mode switching is not supported on the opencode backend.",
+          );
           return;
         }
 
-        const entry = entries[0] ?? null;
-        const skills = entry?.skills ?? [];
-        const errors = entry?.errors ?? [];
-
-        if (skills.length === 0) {
-          const msg =
-            errors.length > 0
-              ? "No skills found (some skills failed to load)."
-              : "No skills found. Enable [features].skills=true in $CODEX_HOME/config.toml.";
-          void vscode.window.showInformationMessage(msg);
+        const presets = await ensureCollaborationPresetsFetched(session);
+        if (presets.length === 0) {
+          chatView?.toast(
+            "info",
+            "No collaboration presets found; cannot switch mode.",
+          );
           return;
         }
+        const modeOrder: Record<string, number> = {
+          default: 0,
+          plan: 1,
+        };
+        const sorted = [...presets].sort((a, b) => {
+          const ao = modeOrder[a.mode ?? "default"] ?? 999;
+          const bo = modeOrder[b.mode ?? "default"] ?? 999;
+          if (ao !== bo) return ao - bo;
+          return a.name.localeCompare(b.name);
+        });
 
-        const picked = await vscode.window.showQuickPick(
-          skills.map((s) => ({
-            label: s.name,
-            description: s.description,
-            detail: `${s.scope} • ${s.path}`,
-            skill: s,
-          })),
-          {
-            title: "Codex UI: Skills",
-            matchOnDescription: true,
-            matchOnDetail: true,
-          },
+        // Cycle should always select an explicit preset name, not `null`.
+        // Setting `null` only clears the UI selection and does not reliably reset the
+        // backend's current collaboration mode (it may keep the previous mode).
+        const candidates: Array<{ name: string; label: string }> = sorted.map(
+          (p) => ({
+            name: p.name,
+            label: p.name,
+          }),
         );
-        if (!picked) return;
 
-        chatView?.insertIntoInput(`$${picked.skill.name} `);
+        const currentName = session.collaborationModePresetName ?? null;
+        const currentIndex = candidates.findIndex(
+          (c) => c.name === currentName,
+        );
+        const next = candidates[(currentIndex + 1) % candidates.length]!;
+
+        session.collaborationModePresetName = next.name;
+        saveSessions(extensionContext, sessions);
+
+        upsertBlock(session.id, {
+          id: newLocalId("collabToggle"),
+          type: "system",
+          title: "Collaboration mode",
+          text: `From the next message, apply '${next.label}'.`,
+        });
+        chatView?.refresh();
       },
     ),
   );
@@ -2055,7 +2307,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
         if (session.backendId !== "codez") {
           void vscode.window.showInformationMessage(
-            "Agents は codez セッションでのみ利用できます。",
+            "Agents are available for codez sessions only.",
           );
           return;
         }
@@ -2159,9 +2411,7 @@ export function activate(context: vscode.ExtensionContext): void {
         saveHiddenTabSessions(context);
 
         if (activeSessionId === session.id) {
-          const visible = sessions
-            .listAll()
-            .filter((s) => !hiddenTabSessionIds.has(s.id));
+          const visible = listVisibleTabSessionsOrdered(sessions);
           const next =
             visible.find((s) => s.backendKey === session.backendKey) ??
             visible[0] ??
@@ -2170,6 +2420,133 @@ export function activate(context: vscode.ExtensionContext): void {
           else activeSessionId = null;
         }
 
+        chatView?.refresh();
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codez._internal.moveWorkspaceTab",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
+        if (!extensionContext) throw new Error("extensionContext is not set");
+
+        if (typeof args !== "object" || args === null) return;
+        const a = args as Record<string, unknown>;
+        const workspaceFolderUri =
+          typeof a["workspaceFolderUri"] === "string"
+            ? a["workspaceFolderUri"].trim()
+            : "";
+        const targetWorkspaceFolderUriRaw = a["targetWorkspaceFolderUri"];
+        const targetWorkspaceFolderUri =
+          typeof targetWorkspaceFolderUriRaw === "string"
+            ? targetWorkspaceFolderUriRaw.trim()
+            : null;
+        const positionRaw = a["position"];
+        const position =
+          positionRaw === "before" ||
+          positionRaw === "after" ||
+          positionRaw === "end"
+            ? positionRaw
+            : null;
+
+        if (!workspaceFolderUri) return;
+        if (!position) return;
+
+        const all = sessions.listAll();
+        const existingWorkspaces = new Set<string>(
+          uniqueWorkspacesInOrder(all),
+        );
+        if (!existingWorkspaces.has(workspaceFolderUri)) return;
+        if (
+          targetWorkspaceFolderUri &&
+          !existingWorkspaces.has(targetWorkspaceFolderUri)
+        ) {
+          return;
+        }
+
+        const current = canonicalWorkspaceOrder(all).filter(
+          (wk) => wk !== workspaceFolderUri,
+        );
+        let insertAt = current.length;
+        if (targetWorkspaceFolderUri) {
+          const targetIdx = current.indexOf(targetWorkspaceFolderUri);
+          if (targetIdx < 0) return;
+          insertAt = position === "after" ? targetIdx + 1 : targetIdx;
+        }
+        current.splice(insertAt, 0, workspaceFolderUri);
+        tabOrder.workspaceOrder = current;
+        saveTabOrder(extensionContext);
+
+        sessionTree?.refresh();
+        chatView?.refresh();
+      },
+    ),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "codez._internal.moveSessionTab",
+      async (args?: unknown) => {
+        if (!sessions) throw new Error("sessions is not initialized");
+        if (!extensionContext) throw new Error("extensionContext is not set");
+
+        if (typeof args !== "object" || args === null) return;
+        const a = args as Record<string, unknown>;
+        const workspaceFolderUri =
+          typeof a["workspaceFolderUri"] === "string"
+            ? a["workspaceFolderUri"].trim()
+            : "";
+        const sessionId =
+          typeof a["sessionId"] === "string" ? a["sessionId"].trim() : "";
+        const targetSessionIdRaw = a["targetSessionId"];
+        const targetSessionId =
+          typeof targetSessionIdRaw === "string"
+            ? targetSessionIdRaw.trim()
+            : null;
+        const positionRaw = a["position"];
+        const position =
+          positionRaw === "before" ||
+          positionRaw === "after" ||
+          positionRaw === "end"
+            ? positionRaw
+            : null;
+
+        if (!workspaceFolderUri) return;
+        if (!sessionId) return;
+        if (!position) return;
+
+        const all = sessions.listAll();
+        const sessionsInWorkspace = all.filter(
+          (s) => s.workspaceFolderUri === workspaceFolderUri,
+        );
+        if (!sessionsInWorkspace.some((s) => s.id === sessionId)) return;
+        if (
+          targetSessionId &&
+          !sessionsInWorkspace.some((s) => s.id === targetSessionId)
+        ) {
+          return;
+        }
+
+        const current = canonicalSessionOrderForWorkspace(
+          workspaceFolderUri,
+          all,
+        ).filter((id) => id !== sessionId);
+        let insertAt = current.length;
+        if (targetSessionId) {
+          const targetIdx = current.indexOf(targetSessionId);
+          if (targetIdx < 0) return;
+          insertAt = position === "after" ? targetIdx + 1 : targetIdx;
+        }
+        current.splice(insertAt, 0, sessionId);
+        tabOrder.sessionOrderByWorkspace = {
+          ...tabOrder.sessionOrderByWorkspace,
+          [workspaceFolderUri]: current,
+        };
+        saveTabOrder(extensionContext);
+
+        sessionTree?.refresh();
         chatView?.refresh();
       },
     ),
@@ -2191,13 +2568,39 @@ export function activate(context: vscode.ExtensionContext): void {
         sessions.remove(session.id);
         saveSessions(extensionContext, sessions);
 
+        const stillHasWorkspace = sessions
+          .listAll()
+          .some((s) => s.workspaceFolderUri === session.workspaceFolderUri);
+        const prevWorkspaceOrder = tabOrder.workspaceOrder;
+        tabOrder.workspaceOrder = stillHasWorkspace
+          ? prevWorkspaceOrder
+          : prevWorkspaceOrder.filter(
+              (wk) => wk !== session.workspaceFolderUri,
+            );
+        const prevIds =
+          tabOrder.sessionOrderByWorkspace[session.workspaceFolderUri] ?? null;
+        if (prevIds) {
+          const nextIds = prevIds.filter((id) => id !== session.id);
+          if (stillHasWorkspace && nextIds.length > 0) {
+            tabOrder.sessionOrderByWorkspace = {
+              ...tabOrder.sessionOrderByWorkspace,
+              [session.workspaceFolderUri]: nextIds,
+            };
+          } else {
+            const next = { ...tabOrder.sessionOrderByWorkspace };
+            delete next[session.workspaceFolderUri];
+            tabOrder.sessionOrderByWorkspace = next;
+          }
+        }
+        saveTabOrder(extensionContext);
+
         runtimeBySessionId.delete(session.id);
         hiddenTabSessionIds.delete(session.id);
         unreadSessionIds.delete(session.id);
         saveHiddenTabSessions(extensionContext);
 
         if (activeSessionId === session.id) {
-          const visible = sessions.listAll();
+          const visible = listVisibleTabSessionsOrdered(sessions);
           const next =
             visible.find((s) => s.backendKey === session.backendKey) ??
             visible[0] ??
@@ -2253,7 +2656,7 @@ export function activate(context: vscode.ExtensionContext): void {
             session = await backendManager.newSession(
               folder,
               backendId,
-              getSessionModelState(null),
+              undefined,
             );
           }
         }
@@ -2282,7 +2685,6 @@ export function activate(context: vscode.ExtensionContext): void {
         void ensureModelsFetched(session);
         hydrateRuntimeFromThread(session.id, res.thread);
         setActiveSession(session.id);
-        refreshCustomPromptsFromDisk();
         await showCodezViewContainer();
       },
     ),
@@ -2313,9 +2715,12 @@ export function activate(context: vscode.ExtensionContext): void {
         if (anyRunning) {
           const rt = ensureRuntime(session.id);
           rt.uiHydrationBlockedText =
-            "他のセッションが実行中のため、このセッションの履歴を読み込めません。\nStop してから Load history を実行してください。";
+            "Cannot load this session's history while another session is running.\nStop it, then run 'Load history'.";
           chatView.refresh();
-          chatView.toast("info", "他のセッションが実行中です。Stop してから実行してください。");
+          chatView.toast(
+            "info",
+            "Another session is running. Stop it and try again.",
+          );
           return;
         }
 
@@ -2324,8 +2729,16 @@ export function activate(context: vscode.ExtensionContext): void {
         hydrateRuntimeFromThread(session.id, res.thread);
         const rt = ensureRuntime(session.id);
         rt.uiHydrationBlockedText = null;
-        setActiveSession(session.id);
-        refreshCustomPromptsFromDisk();
+        if (
+          decideLoadHistoryPostHydrationAction({
+            activeSessionId,
+            targetSessionId: session.id,
+          }) === "refresh"
+        ) {
+          chatView.refresh();
+        } else {
+          setActiveSession(session.id);
+        }
         await showCodezViewContainer();
       },
     ),
@@ -2403,20 +2816,26 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
 
-        // Session switching should be a pure UI operation.
-        // If history hasn't been loaded yet (e.g. after extension host reload), do NOT auto-resume:
-        // doing network calls on tab-click can interrupt or confuse in-progress turns.
-        setActiveSession(session.id, { markRead: false });
+        // Switch tab first so unread/badge state updates immediately.
+        // Use a single activation to avoid duplicate prompt refreshes.
+        setActiveSession(session.id);
         await showCodezViewContainer();
 
         const rt = ensureRuntime(session.id);
-        if (hasConversationBlocks(rt)) {
+        const selection = decideSessionSelection(hasConversationBlocks(rt));
+        const mustForceLoad = shouldForceLoadHistoryForRewind({
+          backendId: session.backendId,
+          hasUserBlockWithoutTurnId: hasUserBlockWithoutTurnId(rt),
+        });
+        if (selection === "alreadyLoaded" && !mustForceLoad) {
           rt.uiHydrationBlockedText = null;
-        } else {
-          rt.uiHydrationBlockedText =
-            "このセッションの履歴はまだ UI に読み込まれていません。\nLoad history を押すか、SESSIONS から開いてください。";
+          chatView?.refresh();
+          return;
         }
-        setActiveSession(session.id);
+
+        await vscode.commands.executeCommand("codez._internal.loadHistoryForSession", {
+          sessionId: session.id,
+        });
       },
     ),
   );
@@ -2814,8 +3233,8 @@ async function pickBackendIdForNewSession(
       backendId,
     })),
     {
-      title: "バックエンドを選択",
-      placeHolder: "このセッションをどのバックエンドで作成しますか？",
+      title: "Select backend",
+      placeHolder: "Which backend should this session use?",
     },
   );
   return picked?.backendId ?? null;
@@ -2834,8 +3253,18 @@ async function sendUserInput(
   const backendImages: BackendImageInput[] = [];
   const trimmed = text.trim();
   if (trimmed) {
-    upsertBlock(session.id, { id: newLocalId("user"), type: "user", text });
+    const userBlockId = newLocalId("user");
+    rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnSend({
+      trimmedText: trimmed,
+      userBlockId,
+    });
+    upsertBlock(session.id, { id: userBlockId, type: "user", text });
     sessionPanels?.addUserMessage(session.id, text);
+  } else {
+    rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnSend({
+      trimmedText: trimmed,
+      userBlockId: "",
+    });
   }
   if (images.length > 0) {
     const galleryImages: Array<{
@@ -2915,14 +3344,116 @@ async function sendUserInput(
   chatView?.refresh();
   schedulePersistRuntime(session.id);
 
+  let collaborationMode: CollaborationMode | null = null;
+  if (
+    session.backendId !== "opencode" &&
+    session.collaborationModePresetName &&
+    session.collaborationModePresetName.trim()
+  ) {
+    const presets = await ensureCollaborationPresetsFetched(session);
+    const preset =
+      presets.find((p) => p.name === session.collaborationModePresetName) ??
+      null;
+    if (!preset) {
+      rt.sending = false;
+      const msg = `collaboration mode preset not found: ${session.collaborationModePresetName}`;
+      upsertBlock(session.id, {
+        id: newLocalId("collabMissing"),
+        type: "error",
+        title: "Collaboration mode",
+        text: msg,
+      });
+      chatView?.refresh();
+      throw new Error(msg);
+    }
+    const resolvedModel = preset.model ?? modelState?.model ?? null;
+    const mode = preset.mode === "plan" ? "plan" : "default";
+    // Presets may omit `model` (upstream builtin presets do). If the user hasn't
+    // explicitly selected a model for this session, resolve the effective model
+    // via backend config/model list so we can populate required v2 fields.
+    let finalModel = resolvedModel;
+    if (!finalModel) {
+      try {
+        const cfg = await backendManager.readConfigForSession(session);
+        finalModel = cfg.config.model ?? null;
+      } catch (err) {
+        outputChannel?.appendLine(
+          `[collab] Failed to resolve model via config/read: ${formatUnknownError(err)}`,
+        );
+      }
+    }
+    if (!finalModel) {
+      try {
+        const models = await backendManager.listModelsForSession(session);
+        finalModel =
+          models.find((m) => m.isDefault)?.model ?? models[0]?.model ?? null;
+      } catch (err) {
+        outputChannel?.appendLine(
+          `[collab] Failed to resolve model via model/list: ${formatUnknownError(err)}`,
+        );
+      }
+    }
+    if (!finalModel) {
+      rt.sending = false;
+      const msg = `collaboration preset '${preset.name}' has no model and no active/effective model could be resolved; cannot apply.`;
+      upsertBlock(session.id, {
+        id: newLocalId("collabInvalid"),
+        type: "error",
+        title: "Collaboration mode",
+        text: msg,
+      });
+      chatView?.refresh();
+      throw new Error(msg);
+    }
+
+    collaborationMode = {
+      mode,
+      settings: {
+        model: finalModel,
+        reasoning_effort: preset.reasoning_effort ?? null,
+        developer_instructions: preset.developer_instructions ?? null,
+      },
+    };
+  }
+
+  const mentionInputs: UserInput[] =
+    session.backendId !== "opencode"
+      ? rt.pendingAppMentions
+          .filter(
+            (m) =>
+              Boolean(m.name) && Boolean(m.path) && text.includes(`$${m.name}`),
+          )
+          .map((m) => ({
+            type: "mention" as const,
+            name: m.name,
+            path: m.path,
+          }))
+      : [];
+  rt.pendingAppMentions.length = 0;
+
+  const personality = session.personality ?? null;
+  const modelSettings =
+    modelState || personality || collaborationMode
+      ? {
+          model: modelState?.model ?? null,
+          provider: modelState?.provider ?? null,
+          reasoning: modelState?.reasoning ?? null,
+          agent: modelState?.agent ?? null,
+          personality,
+          collaborationMode,
+        }
+      : null;
+
   try {
     await backendManager.sendMessageWithModelAndImages(
       session,
       text,
       backendImages,
-      modelState,
+      modelSettings,
+      mentionInputs,
     );
   } catch (err) {
+    rt.pendingLocalUserBlockId = null;
     const errText = formatUnknownError(err);
     const cause = err instanceof Error ? (err as any).cause : null;
     const causeText = cause ? `\ncaused by: ${formatUnknownError(cause)}` : "";
@@ -2942,6 +3473,240 @@ async function sendUserInput(
     throw err;
   }
   schedulePersistRuntime(session.id);
+}
+
+async function steerUserInput(
+  session: Session,
+  text: string,
+  expectedTurnId: string,
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const rt = ensureRuntime(session.id);
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  const mentionInputs: UserInput[] =
+    session.backendId !== "opencode"
+      ? rt.pendingAppMentions
+          .filter(
+            (m) =>
+              Boolean(m.name) && Boolean(m.path) && text.includes(`$${m.name}`),
+          )
+          .map((m) => ({
+            type: "mention" as const,
+            name: m.name,
+            path: m.path,
+          }))
+      : [];
+
+  try {
+    await backendManager.steerMessage(
+      session,
+      text,
+      expectedTurnId,
+      mentionInputs,
+    );
+    rt.pendingAppMentions.length = 0;
+    const userBlockId = newLocalId("user");
+    upsertBlock(session.id, {
+      id: userBlockId,
+      type: "user",
+      text,
+      turnId: expectedTurnId,
+    });
+    sessionPanels?.addUserMessage(session.id, text);
+    chatView?.refresh();
+  } catch (err) {
+    const errText = formatUnknownError(err);
+    outputChannel?.appendLine(
+      `[steer] Failed: sessionId=${session.id} threadId=${session.threadId} turnId=${expectedTurnId} err=${errText}`,
+    );
+    upsertBlock(session.id, {
+      id: newLocalId("error"),
+      type: "error",
+      title: "Steer failed",
+      text: errText,
+    });
+    chatView?.refresh();
+    throw err;
+  }
+  schedulePersistRuntime(session.id);
+}
+
+async function flushQueuedUserInput(sessionId: string): Promise<void> {
+  if (!sessions) return;
+  const rt = ensureRuntime(sessionId);
+  if (rt.flushingQueuedUserInput) return;
+  if (rt.sending) return;
+  if (rt.pendingUserInputQueue.length === 0) return;
+
+  const session = sessions.getById(sessionId);
+  if (!session) {
+    rt.pendingUserInputQueue.length = 0;
+    chatView?.refresh();
+    return;
+  }
+
+  rt.flushingQueuedUserInput = true;
+  try {
+    if (rt.sending) return;
+    const next = rt.pendingUserInputQueue.shift();
+    if (!next) return;
+    await sendUserInput(session, next.text, next.images, next.modelState);
+  } finally {
+    rt.flushingQueuedUserInput = false;
+    chatView?.refresh();
+  }
+}
+
+function registerActionCard(
+  sessionId: string,
+  cardId: string,
+  state: ActionCardState,
+): void {
+  const rt = ensureRuntime(sessionId);
+  rt.actionCards.set(cardId, state);
+}
+
+function getActionCardState(
+  sessionId: string,
+  cardId: string,
+): ActionCardState | null {
+  const rt = ensureRuntime(sessionId);
+  return rt.actionCards.get(cardId) ?? null;
+}
+
+function formatRequestUserInputQuestions(
+  questions: Array<{
+    id: string;
+    header: string;
+    question: string;
+    options: Array<{ label: string; description?: string }> | null;
+    isSecret: boolean;
+  }>,
+): string {
+  const lines: string[] = [];
+  questions.forEach((q, idx) => {
+    const head = q.header?.trim() || `Question ${idx + 1}`;
+    lines.push(`${idx + 1}. ${head}`);
+    if (q.question?.trim()) lines.push(q.question.trim());
+    if (q.options && q.options.length > 0) {
+      lines.push("Options:");
+      for (const opt of q.options) {
+        const detail = opt.description ? ` — ${opt.description}` : "";
+        lines.push(`- ${opt.label}${detail}`);
+      }
+    }
+    if (q.isSecret) {
+      lines.push("(answer will be hidden)");
+    }
+    lines.push("");
+  });
+  return lines.join("\n").trim();
+}
+
+function formatRequestUserInputAnswers(
+  questions: Array<{
+    id: string;
+    header: string;
+    question: string;
+    isSecret: boolean;
+  }>,
+  answersById: Record<string, string[]>,
+  cancelled: boolean,
+): string {
+  if (cancelled) return "Cancelled.";
+  const lines: string[] = [];
+  for (const q of questions) {
+    const label = q.header?.trim() || q.question?.trim() || q.id;
+    if (q.isSecret) {
+      lines.push(`- ${label}: (hidden)`);
+      continue;
+    }
+    const answers = answersById[q.id] ?? [];
+    lines.push(
+      `- ${label}: ${answers.length > 0 ? answers.join(", ") : "(empty)"}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+async function handleRequestUserInputInChat(
+  session: Session,
+  req: {
+    id: string | number;
+    params: {
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      questions: Array<{
+        id: string;
+        header: string;
+        question: string;
+        options: Array<{ label: string; description?: string }> | null;
+        isOther: boolean;
+        isSecret: boolean;
+      }>;
+    };
+  },
+): Promise<{ cancelled: boolean; answersById: Record<string, string[]> }> {
+  if (!chatView) {
+    throw new Error("Chat view is not ready for request_user_input");
+  }
+  const requestKey = requestKeyFromId(req.id);
+  const questions = req.params.questions.map((q) => ({
+    id: q.id,
+    header: q.header,
+    question: q.question,
+    options: q.options,
+    isSecret: q.isSecret,
+  }));
+
+  const promptBlockId = newLocalId("requestUserInput");
+  upsertBlock(session.id, {
+    id: promptBlockId,
+    type: "system",
+    title: "Request user input",
+    text: formatRequestUserInputQuestions(questions),
+  });
+  chatView.refresh();
+  schedulePersistRuntime(session.id);
+
+  const result = await chatView.promptRequestUserInput({
+    sessionId: session.id,
+    requestKey,
+    params: req.params,
+  });
+
+  const responseBlockId = newLocalId("requestUserInputResult");
+  upsertBlock(session.id, {
+    id: responseBlockId,
+    type: "system",
+    title: "Request user input",
+    text: formatRequestUserInputAnswers(
+      questions,
+      result.answersById,
+      result.cancelled,
+    ),
+  });
+  chatView.refresh();
+  schedulePersistRuntime(session.id);
+
+  if (result.cancelled && backendManager) {
+    const rt = ensureRuntime(session.id);
+    const turnId = rt.activeTurnId ?? req.params.turnId;
+    if (turnId) {
+      try {
+        await backendManager.interruptTurn(session, turnId);
+      } catch (err) {
+        outputChannel?.appendLine(
+          `[request_user_input] Failed to interrupt turn: ${String(err)}`,
+        );
+      }
+    }
+  }
+
+  return result;
 }
 
 async function handleSlashCommand(
@@ -3018,7 +3783,7 @@ async function handleSlashCommand(
         id: newLocalId("mcpNoFolder"),
         type: "error",
         title: "MCP servers",
-        text: "このセッションに紐づく workspace folder が見つかりません。",
+        text: "Workspace folder not found for this session.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -3030,7 +3795,119 @@ async function handleSlashCommand(
         id: newLocalId("mcpUnsupported"),
         type: "info",
         title: "MCP servers",
-        text: "opencode backend では MCP server の一覧表示は未対応です。",
+        text: "Listing MCP servers is not supported on the opencode backend.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    await showMcpActionCard(session);
+    return true;
+  }
+  if (cmd === "apps") {
+    if (arg) {
+      upsertBlock(session.id, {
+        id: newLocalId("appsError"),
+        type: "error",
+        title: "Slash command error",
+        text: "/apps does not take arguments.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (session.backendId === "opencode") {
+      upsertBlock(session.id, {
+        id: newLocalId("appsUnsupported"),
+        type: "info",
+        title: "Apps",
+        text: "/apps is not supported on the opencode backend.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    await showAppsActionCard(session);
+    return true;
+  }
+  if (cmd === "personality") {
+    if (arg) {
+      upsertBlock(session.id, {
+        id: newLocalId("personalityError"),
+        type: "error",
+        title: "Slash command error",
+        text: "/personality does not take arguments.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (session.backendId === "opencode") {
+      upsertBlock(session.id, {
+        id: newLocalId("personalityUnsupported"),
+        type: "info",
+        title: "Personality",
+        text: "/personality is not supported on the opencode backend.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    await showPersonalityActionCard(session);
+    return true;
+  }
+  if (cmd === "debug-config") {
+    if (arg) {
+      upsertBlock(session.id, {
+        id: newLocalId("debugConfigError"),
+        type: "error",
+        title: "Slash command error",
+        text: "/debug-config does not take arguments.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (session.backendId === "opencode") {
+      upsertBlock(session.id, {
+        id: newLocalId("debugConfigUnsupported"),
+        type: "info",
+        title: "Debug config",
+        text: "/debug-config is not supported on the opencode backend.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    await showDebugConfigActionCard(session);
+    return true;
+  }
+  if (cmd === "experimental") {
+    if (arg) {
+      upsertBlock(session.id, {
+        id: newLocalId("experimentalError"),
+        type: "error",
+        title: "Slash command error",
+        text: "/experimental does not take arguments.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (session.backendId === "opencode") {
+      upsertBlock(session.id, {
+        id: newLocalId("experimentalUnsupported"),
+        type: "info",
+        title: "Experimental features",
+        text: "/experimental is not supported on the opencode backend.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -3038,45 +3915,163 @@ async function handleSlashCommand(
     }
 
     if (!backendManager) throw new Error("backendManager is not initialized");
-    try {
-      const response = await backendManager.listMcpServerStatus(
-        session.backendKey,
-      );
-      const serverNames = response.data.map((s) => s.name).filter(Boolean);
+    const config = await backendManager.readConfigForSession(session);
+    const features =
+      (((config.config as unknown as Record<string, unknown>)["features"] ??
+        {}) as Record<string, unknown>) || {};
+    const specs = [
+      {
+        key: "shell_snapshot",
+        label: "Shell snapshot",
+        description: "Speed up execution by reducing login shell restarts",
+      },
+      {
+        key: "collab",
+        label: "Sub-agents",
+        description: "Enable sub-agent runs",
+      },
+      {
+        key: "apps",
+        label: "Apps",
+        description: "Use Apps (Connectors) via $ mentions",
+      },
+    ] as const;
 
-      const statusMap = getMcpStatusMap(session.backendKey);
-      for (const name of serverNames) {
-        if (!statusMap.has(name)) statusMap.set(name, "configured");
-      }
+    const items = specs.map((spec) => ({
+      label: spec.label,
+      description: spec.description,
+      detail: `features.${spec.key}`,
+      picked: Boolean(features[spec.key]),
+      key: spec.key,
+    }));
 
-      const icon = (state: string): string =>
-        state === "ready" ? "✓" : state === "starting" ? "…" : "•";
-      const lines = serverNames.map((name) => {
-        const state = statusMap.get(name) ?? "configured";
-        return `${icon(state)} ${name}`;
+    const picked = await vscode.window.showQuickPick(items, {
+      title: "Experimental features",
+      placeHolder: "Select features to enable (multi-select)",
+      canPickMany: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!picked) return true;
+
+    const selected = new Set(picked.map((item) => item.key));
+    const preferredPath =
+      await resolvePreferredConfigWritePathForSession(session);
+    let changed = 0;
+    for (const spec of specs) {
+      const enabled = selected.has(spec.key);
+      const current = Boolean(features[spec.key]);
+      if (enabled === current) continue;
+      await backendManager.writeConfigValueForSession(session, {
+        keyPath: `features.${spec.key}`,
+        value: enabled,
+        mergeStrategy: "upsert",
+        filePath: preferredPath,
       });
+      changed += 1;
+    }
 
+    if (changed === 0) {
       upsertBlock(session.id, {
-        id: newLocalId("mcp"),
+        id: newLocalId("experimentalNoChange"),
+        type: "info",
+        title: "Experimental features",
+        text: "No changes.",
+      });
+    } else {
+      const targetText = preferredPath
+        ? `Saved to ${path.relative(
+            resolveWorkspaceFolderForSession(session)?.uri.fsPath ?? "",
+            preferredPath,
+          )}.`
+        : "Saved to user config.toml.";
+      upsertBlock(session.id, {
+        id: newLocalId("experimentalUpdated"),
         type: "system",
-        title: "MCP servers",
-        text: ["MCP servers:", ...lines].join("\n"),
+        title: "Experimental features",
+        text: `Updated ${changed} feature(s). ${targetText}`,
       });
-      chatView?.refresh();
-      schedulePersistRuntime(session.id);
-      return true;
-    } catch (err) {
-      const msg = formatUnknownError(err);
+    }
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return true;
+  }
+  if (cmd === "collab") {
+    if (arg) {
       upsertBlock(session.id, {
-        id: newLocalId("mcpListError"),
+        id: newLocalId("collabError"),
         type: "error",
-        title: "MCP servers",
-        text: msg,
+        title: "Slash command error",
+        text: "/collab does not take arguments.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
       return true;
     }
+
+    if (session.backendId === "opencode") {
+      upsertBlock(session.id, {
+        id: newLocalId("collabUnsupported"),
+        type: "info",
+        title: "Collaboration mode",
+        text: "/collab is not supported on the opencode backend.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    if (!sessions) throw new Error("sessions is not initialized");
+    if (!extensionContext) throw new Error("extensionContext is not set");
+
+    const presets = await ensureCollaborationPresetsFetched(session);
+    if (presets.length === 0) {
+      upsertBlock(session.id, {
+        id: newLocalId("collabEmpty"),
+        type: "info",
+        title: "Collaboration mode",
+        text: "No collaboration presets available.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return true;
+    }
+
+    const items: Array<vscode.QuickPickItem & { presetName: string | null }> = [
+      {
+        label: "Default",
+        description: "Disable collaboration preset (use normal settings)",
+        presetName: null,
+      },
+      ...presets.map((p) => ({
+        label: p.name,
+        description: p.mode ? `mode=${p.mode}` : "",
+        detail: p.model ? `model=${p.model}` : "",
+        presetName: p.name,
+      })),
+    ];
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: "Collaboration mode",
+      placeHolder: "Pick a collaboration preset (Shift+Tab cycles in input).",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!picked) return true;
+
+    session.collaborationModePresetName = picked.presetName;
+    saveSessions(extensionContext, sessions);
+
+    upsertBlock(session.id, {
+      id: newLocalId("collabSet"),
+      type: "system",
+      title: "Collaboration mode",
+      text: `Set to ${picked.label}.`,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return true;
   }
   if (cmd === "init") {
     if (arg) {
@@ -3097,7 +4092,7 @@ async function handleSlashCommand(
         id: newLocalId("initNoFolder"),
         type: "error",
         title: "Init failed",
-        text: "このセッションに紐づく workspace folder が見つかりません。",
+        text: "Workspace folder not found for this session.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -3131,7 +4126,7 @@ async function handleSlashCommand(
         id: newLocalId("initSkip"),
         type: "info",
         title: "Init skipped",
-        text: `${DEFAULT_PROJECT_DOC_FILENAME} が既に存在するため、上書き防止のため /init をスキップしました。`,
+        text: `${DEFAULT_PROJECT_DOC_FILENAME} already exists, so /init was skipped to avoid overwriting it.`,
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -3160,7 +4155,7 @@ async function handleSlashCommand(
         id: newLocalId("compactUnsupported"),
         type: "info",
         title: "Compact (codez only)",
-        text: "/compact は codez セッションのみ対応です。",
+        text: "/compact is supported for codez sessions only.",
       });
       chatView?.refresh();
       schedulePersistRuntime(session.id);
@@ -3255,9 +4250,9 @@ async function handleSlashCommand(
     return true;
   }
   if (cmd === "skills") {
-    await vscode.commands.executeCommand("codez.showSkills", {
-      sessionId: session.id,
-    });
+    const forceReload = arg === "--reload" || arg === "reload";
+    if (forceReload) chatView?.invalidateSkillIndex(session.id);
+    await showSkillsActionCard(session, { forceReload });
     return true;
   }
   if (cmd === "agents") {
@@ -3444,18 +4439,23 @@ async function handleSlashCommand(
         "Slash commands:",
         mineSelected
           ? "- /compact: Compact context"
-          : "- /compact: (codez 選択時のみ対応)",
+          : "- /compact: (codez sessions only)",
         "- /new: New session",
         "- /init: Create AGENTS.md",
         "- /resume: Resume from history",
         "- /status: Show status",
         "- /mcp: List MCP servers",
+        "- /apps: Browse apps",
+        "- /collab: Change collaboration mode (Shift+Tab in input)",
+        "- /personality: Set personality",
+        "- /debug-config: Show config details",
+        "- /experimental: Toggle experimental features",
         "- /diff: Open Latest Diff",
         "- /rename <title>: Rename session",
-        "- /skills: Browse skills",
+        "- /skills [--reload]: Browse skills",
         mineSelected
           ? "- /agents: Browse agents"
-          : "- /agents: Browse agents (codez 選択時のみ対応)",
+          : "- /agents: Browse agents (codez sessions only)",
         "- /account: Account management",
         "- /help: Show help",
         customList ? "\nCustom prompts:" : null,
@@ -3474,6 +4474,514 @@ async function handleSlashCommand(
   }
 
   return false;
+}
+
+async function showPersonalityActionCard(
+  session: Session,
+  opts?: { cardId?: string },
+): Promise<void> {
+  if (!sessions) throw new Error("sessions is not initialized");
+  if (!extensionContext) throw new Error("extensionContext is not set");
+
+  const cardId = opts?.cardId ?? newLocalId("personalityCard");
+  const current = session.personality ?? null;
+  const choices: Array<{
+    label: string;
+    description: string;
+    personality: Personality | null;
+  }> = [
+    {
+      label: "default",
+      description: "Backend default personality",
+      personality: null,
+    },
+    {
+      label: "friendly",
+      description: "Friendly tone",
+      personality: "friendly",
+    },
+    {
+      label: "pragmatic",
+      description: "Pragmatic tone",
+      personality: "pragmatic",
+    },
+  ];
+
+  const actions = new Map<
+    string,
+    { label: string; personality: Personality | null }
+  >();
+  const actionButtons = choices.map((c) => {
+    const id = `personality:${c.label}`;
+    actions.set(id, { label: c.label, personality: c.personality });
+    return {
+      id,
+      label: c.label,
+      style: current === c.personality ? "primary" : "default",
+    } as const;
+  });
+
+  const models = getModelOptionsForSession(session) ?? [];
+  const modelState = getSessionModelState(session.id);
+  const selectedKey = String(modelState.model || "").trim();
+  const selected =
+    models.find((m) => String(m.model || m.id) === selectedKey) ??
+    models.find((m) => Boolean(m.isDefault)) ??
+    null;
+  const supportsPersonality =
+    selected && typeof selected.supportsPersonality === "boolean"
+      ? selected.supportsPersonality
+      : null;
+
+  const lines = [
+    `Current: ${current ?? "default"}`,
+    supportsPersonality === false
+      ? "Note: selected model does not support personality."
+      : null,
+    "",
+    "Pick a personality for this session:",
+    ...choices.map((c) => `- ${c.label}: ${c.description}`),
+  ].filter(Boolean);
+
+  registerActionCard(session.id, cardId, {
+    kind: "personality",
+    actions,
+  });
+  upsertBlock(session.id, {
+    id: cardId,
+    type: "actionCard",
+    title: "Personality",
+    text: lines.join("\n"),
+    actions: actionButtons,
+  });
+  chatView?.refresh();
+  schedulePersistRuntime(session.id);
+}
+
+async function showAppsActionCard(
+  session: Session,
+  opts?: { cardId?: string },
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+
+  const cardId = opts?.cardId ?? newLocalId("appsCard");
+  try {
+    const apps = await backendManager.listAppsForSession(session);
+    if (apps.length === 0) {
+      upsertBlock(session.id, {
+        id: cardId,
+        type: "info",
+        title: "Apps",
+        text: "No apps available.",
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return;
+    }
+
+    const actions = new Map<string, { app: AppInfo }>();
+    const actionButtons = apps
+      .filter((a) => a.isAccessible)
+      .map((a, idx) => {
+        const id = `app:${idx}:${a.id}`;
+        actions.set(id, { app: a });
+        return { id, label: `Insert $${a.name}`, style: "primary" as const };
+      });
+
+    const lines = [
+      "Available apps:",
+      ...apps.map((a) => {
+        const access = a.isAccessible ? "" : " (not accessible)";
+        const detail = a.description || a.installUrl || "";
+        return `- $${a.name}${access}${detail ? ` — ${detail}` : ""}`;
+      }),
+    ];
+
+    registerActionCard(session.id, cardId, { kind: "apps", actions });
+    upsertBlock(session.id, {
+      id: cardId,
+      type: "actionCard",
+      title: "Apps",
+      text: lines.join("\n"),
+      actions: actionButtons,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  } catch (err) {
+    const msg = formatUnknownError(err);
+    upsertBlock(session.id, {
+      id: newLocalId("appsListError"),
+      type: "error",
+      title: "Apps",
+      text: msg,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  }
+}
+
+async function showMcpActionCard(
+  session: Session,
+  opts?: { cardId?: string },
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const cardId = opts?.cardId ?? newLocalId("mcpCard");
+
+  try {
+    const response = await backendManager.listMcpServerStatus(
+      session.backendKey,
+    );
+    const serverNames = response.data.map((s) => s.name).filter(Boolean);
+
+    const statusMap = getMcpStatusMap(session.backendKey);
+    for (const name of serverNames) {
+      if (!statusMap.has(name)) statusMap.set(name, "configured");
+    }
+
+    const icon = (state: string): string =>
+      state === "ready" ? "✓" : state === "starting" ? "…" : "•";
+    const lines =
+      serverNames.length > 0
+        ? serverNames.map((name) => {
+            const state = statusMap.get(name) ?? "configured";
+            return `- ${icon(state)} ${name}`;
+          })
+        : ["(no MCP servers configured)"];
+
+    const actions = new Map<string, { action: "refresh" }>();
+    actions.set("refresh", { action: "refresh" });
+    registerActionCard(session.id, cardId, { kind: "mcp", actions });
+    upsertBlock(session.id, {
+      id: cardId,
+      type: "actionCard",
+      title: "MCP servers",
+      text: ["MCP servers:", ...lines].join("\n"),
+      actions: [{ id: "refresh", label: "Refresh", style: "primary" }],
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  } catch (err) {
+    const msg = formatUnknownError(err);
+    upsertBlock(session.id, {
+      id: newLocalId("mcpListError"),
+      type: "error",
+      title: "MCP servers",
+      text: msg,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  }
+}
+
+async function showSkillsActionCard(
+  session: Session,
+  opts?: { cardId?: string; forceReload?: boolean },
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+
+  const cardId = opts?.cardId ?? newLocalId("skillsCard");
+  let entries: SkillsListEntry[] = [];
+  let localError: string | null = null;
+  try {
+    entries = await backendManager.listSkillsForSession(session, {
+      forceReload: opts?.forceReload ?? false,
+    });
+  } catch (err) {
+    localError = formatUnknownError(err);
+  }
+
+  const entry = entries[0] ?? null;
+  const skills = entry?.skills ?? [];
+  const errors = entry?.errors ?? [];
+
+  if (!localError) {
+    chatView?.postSkillIndex(
+      session.id,
+      skills.map((s) => ({
+        name: s.name,
+        description: s.description,
+        scope: s.scope,
+        path: s.path,
+      })),
+    );
+  }
+
+  let remoteSkills: RemoteSkillSummary[] = [];
+  let remoteError: string | null = null;
+  try {
+    remoteSkills = await backendManager.listRemoteSkillsForSession(session);
+  } catch (err) {
+    remoteError = formatUnknownError(err);
+  }
+
+  const lines: string[] = [];
+  if (localError) {
+    lines.push(`Local skills: failed to load (${localError})`);
+  } else if (skills.length === 0) {
+    const msg =
+      errors.length > 0
+        ? "Local skills: none (some skills failed to load)."
+        : "Local skills: none (enable [features].skills=true in config).";
+    lines.push(msg);
+  } else {
+    lines.push("Local skills:");
+    for (const s of skills) {
+      const detail = s.description ? ` — ${s.description}` : "";
+      lines.push(`- $${s.name}${detail}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    lines.push("");
+    lines.push("Local skill errors:");
+    for (const e of errors) {
+      lines.push(`- ${e.path}: ${e.message}`);
+    }
+  }
+
+  lines.push("");
+  if (remoteError) {
+    lines.push(`Remote skills: failed to load (${remoteError})`);
+  } else if (remoteSkills.length === 0) {
+    lines.push("Remote skills: none");
+  } else {
+    lines.push("Remote skills:");
+    for (const r of remoteSkills) {
+      const detail = r.description ? ` — ${r.description}` : "";
+      lines.push(`- ${r.name}${detail}`);
+    }
+  }
+
+  const actions = new Map<
+    string,
+    | { kind: "insert"; skill: SkillMetadata }
+    | { kind: "download"; remote: RemoteSkillSummary }
+    | { kind: "refresh" }
+  >();
+  const actionButtons: Array<{
+    id: string;
+    label: string;
+    style?: "primary" | "default";
+  }> = [];
+
+  actions.set("skills:refresh", { kind: "refresh" });
+  actionButtons.push({ id: "skills:refresh", label: "Refresh", style: "primary" });
+
+  for (const s of skills) {
+    const id = `skill:insert:${s.name}`;
+    actions.set(id, { kind: "insert", skill: s });
+    actionButtons.push({ id, label: `Insert $${s.name}` });
+  }
+  for (const r of remoteSkills) {
+    const id = `skill:download:${r.id}`;
+    actions.set(id, { kind: "download", remote: r });
+    actionButtons.push({ id, label: `Download ${r.name}` });
+  }
+
+  registerActionCard(session.id, cardId, { kind: "skills", actions });
+  upsertBlock(session.id, {
+    id: cardId,
+    type: "actionCard",
+    title: "Skills",
+    text: lines.join("\n").trim(),
+    actions: actionButtons,
+  });
+  chatView?.refresh();
+  schedulePersistRuntime(session.id);
+}
+
+async function showDebugConfigActionCard(
+  session: Session,
+  opts?: { cardId?: string },
+): Promise<void> {
+  if (!backendManager) throw new Error("backendManager is not initialized");
+  const cardId = opts?.cardId ?? newLocalId("debugConfigCard");
+
+  try {
+    const res: ConfigReadResponse =
+      await backendManager.readConfigForSession(session);
+    const configJson = JSON.stringify(res.config, null, 2);
+    const layersJson = JSON.stringify(res.layers ?? [], null, 2);
+    const originsJson = JSON.stringify(res.origins ?? {}, null, 2);
+    const limit = 10_000;
+    const configText =
+      configJson.length <= limit
+        ? configJson
+        : `${configJson.slice(0, limit)}\n...(truncated ${configJson.length - limit} chars)`;
+    const layersText =
+      layersJson.length <= limit
+        ? layersJson
+        : `${layersJson.slice(0, limit)}\n...(truncated ${layersJson.length - limit} chars)`;
+    const originsText =
+      originsJson.length <= limit
+        ? originsJson
+        : `${originsJson.slice(0, limit)}\n...(truncated ${originsJson.length - limit} chars)`;
+
+    const actions = new Map<
+      string,
+      { kind: "copyConfig" | "copyLayers"; payload: string }
+    >();
+    actions.set("copyConfig", { kind: "copyConfig", payload: configJson });
+    actions.set("copyLayers", { kind: "copyLayers", payload: layersJson });
+
+    registerActionCard(session.id, cardId, { kind: "debugConfig", actions });
+    upsertBlock(session.id, {
+      id: cardId,
+      type: "actionCard",
+      title: "Debug config",
+      text: [
+        "Effective config:",
+        "```json",
+        configText,
+        "```",
+        "",
+        "Layers:",
+        "```json",
+        layersText,
+        "```",
+        "",
+        "Origins:",
+        "```json",
+        originsText,
+        "```",
+      ].join("\n"),
+      actions: [
+        { id: "copyConfig", label: "Copy config JSON", style: "primary" },
+        { id: "copyLayers", label: "Copy layers JSON" },
+      ],
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  } catch (err) {
+    const msg = formatUnknownError(err);
+    upsertBlock(session.id, {
+      id: newLocalId("debugConfigError"),
+      type: "error",
+      title: "Debug config",
+      text: msg,
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+  }
+}
+
+async function handleActionCardAction(args: {
+  sessionId: string;
+  cardId: string;
+  actionId: string;
+}): Promise<void> {
+  if (!sessions) throw new Error("sessions is not initialized");
+  if (!extensionContext) throw new Error("extensionContext is not set");
+
+  const session = sessions.getById(args.sessionId);
+  if (!session) return;
+  const state = getActionCardState(args.sessionId, args.cardId);
+  if (!state) {
+    upsertBlock(session.id, {
+      id: newLocalId("actionCardMissing"),
+      type: "error",
+      title: "Action card",
+      text: "Action card state not found. Please re-run the command.",
+    });
+    chatView?.refresh();
+    schedulePersistRuntime(session.id);
+    return;
+  }
+
+  if (state.kind === "personality") {
+    const action = state.actions.get(args.actionId);
+    if (!action) return;
+    session.personality = action.personality;
+    saveSessions(extensionContext, sessions);
+    upsertBlock(session.id, {
+      id: newLocalId("personalitySet"),
+      type: "info",
+      title: "Personality",
+      text: `Set to ${action.label}.`,
+    });
+    await showPersonalityActionCard(session, { cardId: args.cardId });
+    return;
+  }
+
+  if (state.kind === "apps") {
+    const action = state.actions.get(args.actionId);
+    if (!action) return;
+    const rt = ensureRuntime(session.id);
+    const name = String(action.app.name || "").trim();
+    const id = String(action.app.id || "").trim();
+    if (name && id) {
+      const path = `app://${id}`;
+      const existing = rt.pendingAppMentions.find(
+        (m) => m.name === name && m.path === path,
+      );
+      if (!existing) rt.pendingAppMentions.push({ name, path });
+      chatView?.insertIntoInput(`$${name} `);
+    }
+    return;
+  }
+
+  if (state.kind === "mcp") {
+    const action = state.actions.get(args.actionId);
+    if (!action) return;
+    if (action.action === "refresh") {
+      await showMcpActionCard(session, { cardId: args.cardId });
+    }
+    return;
+  }
+
+  if (state.kind === "skills") {
+    const action = state.actions.get(args.actionId);
+    if (!action) return;
+    if (action.kind === "refresh") {
+      chatView?.invalidateSkillIndex(session.id);
+      await showSkillsActionCard(session, {
+        cardId: args.cardId,
+        forceReload: true,
+      });
+      return;
+    }
+    if (action.kind === "insert") {
+      chatView?.insertIntoInput(`$${action.skill.name} `);
+      return;
+    }
+    if (!backendManager) throw new Error("backendManager is not initialized");
+    try {
+      const res = await backendManager.downloadRemoteSkillForSession(
+        session,
+        action.remote.id,
+      );
+      upsertBlock(session.id, {
+        id: newLocalId("remoteSkillDownloaded"),
+        type: "info",
+        title: "Remote skill downloaded",
+        text: `${res.name} → ${res.path}`,
+      });
+      chatView?.invalidateSkillIndex(session.id);
+      await showSkillsActionCard(session, {
+        cardId: args.cardId,
+        forceReload: true,
+      });
+      return;
+    } catch (err) {
+      const msg = formatUnknownError(err);
+      upsertBlock(session.id, {
+        id: newLocalId("remoteSkillError"),
+        type: "error",
+        title: "Remote skill download failed",
+        text: msg,
+      });
+      chatView?.refresh();
+      schedulePersistRuntime(session.id);
+      return;
+    }
+  }
+
+  if (state.kind === "debugConfig") {
+    const action = state.actions.get(args.actionId);
+    if (!action) return;
+    await vscode.env.clipboard.writeText(action.payload);
+    chatView?.toast("success", "Copied to clipboard.");
+  }
 }
 
 function formatThreadLabel(preview: string): string {
@@ -3569,6 +5077,24 @@ function resolveWorkspaceFolderForSession(
   return vscode.workspace.getWorkspaceFolder(uri) ?? null;
 }
 
+async function resolvePreferredConfigWritePathForSession(
+  session: Session,
+): Promise<string | null> {
+  const folder = resolveWorkspaceFolderForSession(session);
+  if (!folder) return null;
+  const projectConfigPath = path.join(
+    folder.uri.fsPath,
+    ".codex",
+    "config.toml",
+  );
+  try {
+    await fs.access(projectConfigPath);
+    return projectConfigPath;
+  } catch {
+    return null;
+  }
+}
+
 function formatAsAttachment(
   label: string,
   content: string,
@@ -3653,6 +5179,7 @@ function hasConversationBlocks(rt: SessionRuntime): boolean {
       case "command":
       case "fileChange":
       case "mcp":
+      case "collab":
       case "webSearch":
       case "reasoning":
       case "step":
@@ -3663,6 +5190,16 @@ function hasConversationBlocks(rt: SessionRuntime): boolean {
         return false;
     }
   });
+}
+
+function hasUserBlockWithoutTurnId(rt: SessionRuntime): boolean {
+  for (const b of rt.blocks) {
+    if (b.type !== "user") continue;
+    const turnId =
+      typeof (b as any).turnId === "string" ? (b as any).turnId.trim() : "";
+    if (!turnId) return true;
+  }
+  return false;
 }
 
 function setActiveSession(
@@ -3680,6 +5217,7 @@ function setActiveSession(
       model: null,
       provider: null,
       reasoning: null,
+      agent: null,
     });
   }
   if (markRead) unreadSessionIds.delete(sessionId);
@@ -3694,6 +5232,7 @@ function setActiveSession(
     if (extensionContext) saveHiddenTabSessions(extensionContext);
   }
   if (s) void ensureModelsFetched(s);
+  refreshCustomPromptsFromDisk(s);
   chatView?.refresh();
   chatView?.syncBlocksForActiveSession();
 }
@@ -3710,6 +5249,136 @@ function loadHiddenTabSessions(context: vscode.ExtensionContext): void {
   for (const v of raw) {
     if (typeof v === "string" && v) hiddenTabSessionIds.add(v);
   }
+}
+
+function loadTabOrder(context: vscode.ExtensionContext): TabOrderState {
+  const raw = context.workspaceState.get<unknown>(TAB_ORDER_KEY);
+  if (!raw || typeof raw !== "object") {
+    return { workspaceOrder: [], sessionOrderByWorkspace: {} };
+  }
+  const o = raw as Record<string, unknown>;
+
+  const workspaceOrder: string[] = [];
+  const wsRaw = o["workspaceOrder"];
+  if (Array.isArray(wsRaw)) {
+    for (const v of wsRaw) {
+      if (typeof v !== "string") continue;
+      const t = v.trim();
+      if (!t) continue;
+      workspaceOrder.push(t);
+    }
+  }
+
+  const sessionOrderByWorkspace: Record<string, string[]> = {};
+  const soRaw = o["sessionOrderByWorkspace"];
+  if (soRaw && typeof soRaw === "object" && !Array.isArray(soRaw)) {
+    for (const [k, v] of Object.entries(soRaw as Record<string, unknown>)) {
+      if (typeof k !== "string") continue;
+      const wk = k.trim();
+      if (!wk) continue;
+      if (!Array.isArray(v)) continue;
+      const ids: string[] = [];
+      for (const item of v) {
+        if (typeof item !== "string") continue;
+        const id = item.trim();
+        if (!id) continue;
+        ids.push(id);
+      }
+      if (ids.length > 0) sessionOrderByWorkspace[wk] = ids;
+    }
+  }
+
+  return { workspaceOrder, sessionOrderByWorkspace };
+}
+
+function saveTabOrder(context: vscode.ExtensionContext): void {
+  void context.workspaceState.update(TAB_ORDER_KEY, tabOrder);
+}
+
+function uniqueWorkspacesInOrder(sessions: Session[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const s of sessions) {
+    const wk = s.workspaceFolderUri;
+    if (!wk || seen.has(wk)) continue;
+    seen.add(wk);
+    out.push(wk);
+  }
+  return out;
+}
+
+function canonicalWorkspaceOrder(allSessions: Session[]): string[] {
+  const seenInBase = uniqueWorkspacesInOrder(allSessions);
+  const seen = new Set<string>(seenInBase);
+  const out: string[] = [];
+  for (const wk of tabOrder.workspaceOrder) {
+    if (!seen.has(wk)) continue;
+    if (out.includes(wk)) continue;
+    out.push(wk);
+  }
+  for (const wk of seenInBase) {
+    if (out.includes(wk)) continue;
+    out.push(wk);
+  }
+  return out;
+}
+
+function canonicalSessionOrderForWorkspace(
+  workspaceFolderUri: string,
+  allSessions: Session[],
+): string[] {
+  const baseIds = allSessions
+    .filter((s) => s.workspaceFolderUri === workspaceFolderUri)
+    .map((s) => s.id);
+  const existing = new Set<string>(baseIds);
+  const stored = tabOrder.sessionOrderByWorkspace[workspaceFolderUri] ?? [];
+  const out: string[] = [];
+  const outSet = new Set<string>();
+  for (const id of stored) {
+    if (!existing.has(id)) continue;
+    if (outSet.has(id)) continue;
+    outSet.add(id);
+    out.push(id);
+  }
+  for (const id of baseIds) {
+    if (outSet.has(id)) continue;
+    outSet.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function orderSessionsForUi(allSessions: Session[]): Session[] {
+  const byWorkspace = new Map<string, Session[]>();
+  for (const s of allSessions) {
+    const list = byWorkspace.get(s.workspaceFolderUri) ?? [];
+    byWorkspace.set(s.workspaceFolderUri, [...list, s]);
+  }
+
+  const workspaceOrder = canonicalWorkspaceOrder(allSessions);
+  const out: Session[] = [];
+  for (const wk of workspaceOrder) {
+    const group = byWorkspace.get(wk) ?? [];
+    if (group.length === 0) continue;
+    const sessionOrder = canonicalSessionOrderForWorkspace(wk, allSessions);
+    const pos = new Map<string, number>();
+    sessionOrder.forEach((id, idx) => pos.set(id, idx));
+    const sorted = [...group].sort(
+      (a, b) => (pos.get(a.id) ?? 0) - (pos.get(b.id) ?? 0),
+    );
+    out.push(...sorted);
+  }
+  return out;
+}
+
+function listAllSessionsOrdered(store: SessionStore): Session[] {
+  return orderSessionsForUi(store.listAll());
+}
+
+function listVisibleTabSessionsOrdered(store: SessionStore): Session[] {
+  return listAllSessionsOrdered(store).filter(
+    (s) => !hiddenTabSessionIds.has(s.id),
+  );
 }
 
 function loadWorkspaceColorOverrides(
@@ -3767,6 +5436,9 @@ function setCustomPrompts(next: CustomPromptSummary[]): void {
 async function loadInitialModelState(
   output: vscode.OutputChannel,
 ): Promise<void> {
+  output.appendLine(
+    `[config] resolveCodexHome=${resolveCodexHome()} CODEX_HOME=${String(process.env["CODEX_HOME"] || "")}`,
+  );
   const fromHome = await readModelStateFromCodexHomeConfig(output);
   const picked = fromHome;
   if (!picked) {
@@ -3799,7 +5471,7 @@ async function readModelStateFromConfig(
     const provider = pickString(parsed["model_provider"]);
     const reasoning = pickString(parsed["model_reasoning_effort"]);
     if (!model && !provider && !reasoning) return null;
-    return { model, provider, reasoning };
+    return { model, provider, reasoning, agent: null };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     output.appendLine(
@@ -3884,7 +5556,7 @@ function formatResetsAt(unixSeconds: number): string {
   return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${hhmm}`;
 }
 
-function formatDurationJa(ms: number): string {
+function formatDurationEn(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const totalMinutes = Math.floor(totalSeconds / 60);
   const totalHours = Math.floor(totalMinutes / 60);
@@ -3892,10 +5564,10 @@ function formatDurationJa(ms: number): string {
   const hours = totalHours % 24;
   const minutes = totalMinutes % 60;
   const parts: string[] = [];
-  if (days > 0) parts.push(`${days}日`);
-  if (hours > 0 || days > 0) parts.push(`${hours}時間`);
-  parts.push(`${minutes}分`);
-  return parts.join("");
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0 || days > 0) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(" ");
 }
 
 function formatResetsAtTooltip(unixSeconds: number): string {
@@ -3909,8 +5581,8 @@ function formatResetsAtTooltip(unixSeconds: number): string {
   });
   const deltaMs = d.getTime() - Date.now();
   if (!Number.isFinite(deltaMs)) return abs;
-  if (deltaMs >= 0) return `${abs}（あと${formatDurationJa(deltaMs)}）`;
-  return `${abs}（${formatDurationJa(-deltaMs)}前）`;
+  if (deltaMs >= 0) return `${abs} (in ${formatDurationEn(deltaMs)})`;
+  return `${abs} (${formatDurationEn(-deltaMs)} ago)`;
 }
 
 function resolveCodexHome(): string {
@@ -3991,7 +5663,34 @@ function parsePromptFrontmatter(content: string): {
 }
 
 async function loadCustomPromptsFromDisk(): Promise<CustomPromptSummary[]> {
-  const dir = path.join(resolveCodexHome(), "prompts");
+  const session = activeSessionId ? sessions?.getById(activeSessionId) ?? null : null;
+  return await loadCustomPromptsFromDiskForSession(session);
+}
+
+async function loadCustomPromptsFromDiskForSession(
+  session: Session | null,
+): Promise<CustomPromptSummary[]> {
+  const userDir = path.join(resolveCodexHome(), "prompts");
+  const repoDir = await resolveRepoPromptsDirForSession(session);
+
+  const exclude = new Set<string>();
+  const out: CustomPromptSummary[] = [];
+
+  if (repoDir) {
+    const repoPrompts = await discoverPromptsInDir(repoDir, exclude);
+    for (const p of repoPrompts) exclude.add(p.name);
+    out.push(...repoPrompts);
+  }
+  out.push(...(await discoverPromptsInDir(userDir, exclude)));
+
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+async function discoverPromptsInDir(
+  dir: string,
+  exclude: Set<string>,
+): Promise<CustomPromptSummary[]> {
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
     const out: CustomPromptSummary[] = [];
@@ -4001,6 +5700,7 @@ async function loadCustomPromptsFromDisk(): Promise<CustomPromptSummary[]> {
       if (!ext || ext.toLowerCase() !== ".md") continue;
       const name = path.parse(entry.name).name.trim();
       if (!name) continue;
+      if (exclude.has(name)) continue;
       const fullPath = path.join(dir, entry.name);
       const content = await fs.readFile(fullPath, "utf8").catch(() => null);
       if (content === null) continue;
@@ -4020,13 +5720,106 @@ async function loadCustomPromptsFromDisk(): Promise<CustomPromptSummary[]> {
   }
 }
 
-function refreshCustomPromptsFromDisk(): void {
-  void loadCustomPromptsFromDisk()
+function refreshCustomPromptsFromDisk(session: Session | null): void {
+  ensureCustomPromptWatchers(session);
+  void loadCustomPromptsFromDiskForSession(session)
     .then((next) => {
       if (customPrompts.some((p) => p.source === "server")) return;
       setCustomPrompts(next);
     })
     .catch(() => {});
+}
+
+function scheduleRefreshCustomPromptsFromDisk(session: Session | null): void {
+  if (customPromptRefreshTimer) clearTimeout(customPromptRefreshTimer);
+  customPromptRefreshTimer = setTimeout(() => {
+    customPromptRefreshTimer = null;
+    refreshCustomPromptsFromDisk(session);
+  }, 150);
+}
+
+async function resolveRepoPromptsDirForSession(
+  session: Session | null,
+): Promise<string | null> {
+  const folderUri =
+    session?.workspaceFolderUri ??
+    (typeof vscode.workspace.workspaceFolders?.[0]?.uri?.toString === "function"
+      ? vscode.workspace.workspaceFolders?.[0]?.uri.toString()
+      : null);
+  if (!folderUri) return null;
+  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(folderUri));
+  if (!folder) return null;
+
+  const gitRoot = await findGitRoot(folder.uri.fsPath);
+  if (!gitRoot) return null;
+  return path.join(gitRoot, ".codex", "prompts");
+}
+
+async function findGitRoot(start: string): Promise<string | null> {
+  let cur = path.resolve(start);
+  for (let i = 0; i < 50; i += 1) {
+    const gitPath = path.join(cur, ".git");
+    try {
+      const st = await fs.stat(gitPath);
+      if (st.isDirectory() || st.isFile()) return cur;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code && code !== "ENOENT" && code !== "ENOTDIR") {
+        outputChannel?.appendLine(
+          `[prompts] Failed to stat ${gitPath}: ${String((err as Error).message ?? err)}`,
+        );
+      }
+    }
+
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
+function ensureCustomPromptWatchers(session: Session | null): void {
+  if (!extensionContext) return;
+
+  const folder =
+    session?.workspaceFolderUri
+      ? vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(session.workspaceFolderUri))
+      : null;
+  const folderFsPath = folder?.uri.fsPath ?? null;
+  const userDir = path.join(resolveCodexHome(), "prompts");
+
+  const key = `${folderFsPath ?? "(none)"}|${userDir}`;
+  if (customPromptWatcherKey === key) return;
+  customPromptWatcherKey = key;
+
+  for (const w of customPromptWatchers) w.dispose();
+  customPromptWatchers = [];
+
+  const onChange = (): void => scheduleRefreshCustomPromptsFromDisk(session);
+
+  const userPattern = new vscode.RelativePattern(userDir, "*.md");
+  const userWatcher = vscode.workspace.createFileSystemWatcher(userPattern);
+  userWatcher.onDidChange(onChange);
+  userWatcher.onDidCreate(onChange);
+  userWatcher.onDidDelete(onChange);
+  customPromptWatchers.push(userWatcher);
+  extensionContext.subscriptions.push(userWatcher);
+
+  if (folderFsPath) {
+    void findGitRoot(folderFsPath).then((gitRoot) => {
+      if (!gitRoot) return;
+      // Active session may have changed since this async resolution; key guards against staleness.
+      if (customPromptWatcherKey !== key) return;
+      const repoDir = path.join(gitRoot, ".codex", "prompts");
+      const repoPattern = new vscode.RelativePattern(repoDir, "*.md");
+      const repoWatcher = vscode.workspace.createFileSystemWatcher(repoPattern);
+      repoWatcher.onDidChange(onChange);
+      repoWatcher.onDidCreate(onChange);
+      repoWatcher.onDidDelete(onChange);
+      customPromptWatchers.push(repoWatcher);
+      extensionContext?.subscriptions.push(repoWatcher);
+    });
+  }
 }
 
 function ensureRuntime(sessionId: string): SessionRuntime {
@@ -4042,6 +5835,7 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     reloading: false,
     compactInFlight: false,
     pendingCompactBlockId: null,
+    clearUiHistoryAfterCompact: false,
     pendingAssistantDeltas: new Map(),
     pendingAssistantMetaById: new Map(),
     pendingAssistantDeltaFlushTimer: null,
@@ -4056,6 +5850,11 @@ function ensureRuntime(sessionId: string): SessionRuntime {
     legacyWebSearchTargetByCallId: new Map(),
     pendingApprovals: new Map(),
     approvalResolvers: new Map(),
+    pendingAppMentions: [],
+    pendingUserInputQueue: [],
+    pendingLocalUserBlockId: null,
+    flushingQueuedUserInput: false,
+    actionCards: new Map(),
   };
   runtimeBySessionId.set(sessionId, rt);
   return rt;
@@ -4064,6 +5863,48 @@ function ensureRuntime(sessionId: string): SessionRuntime {
 function getModelOptionsForSession(session: Session | null): Model[] | null {
   if (!session || !backendManager) return null;
   return backendManager.getCachedModels(session);
+}
+
+function getUiDefaultModelState(session: Session | null): ModelState {
+  // For codez, repo-local `.codex/config.toml` may override (or completely replace) CODEX_HOME config.
+  // Prefer the backend's effective config when available, so the UI's "default (...)" label matches
+  // what the backend will actually use.
+  if (session && session.backendId === "codez") {
+    const cfg = configByBackendKey.get(session.backendKey)?.config ?? null;
+    if (cfg) {
+      return {
+        model: cfg.model ?? null,
+        provider: cfg.model_provider ?? null,
+        reasoning: cfg.model_reasoning_effort ?? null,
+        agent: null,
+      };
+    }
+  }
+  return getSessionModelState(null);
+}
+
+async function ensureConfigFetched(session: Session): Promise<void> {
+  if (!backendManager) return;
+  const backendKey = session.backendKey;
+  if (configByBackendKey.get(backendKey)) return;
+  const pending = pendingConfigFetchByBackend.get(backendKey);
+  if (pending) {
+    await pending;
+    return;
+  }
+  const promise = backendManager
+    .readConfigForSession(session)
+    .then((cfg) => {
+      configByBackendKey.set(backendKey, cfg);
+    })
+    .catch((err) => {
+      outputChannel?.appendLine(
+        `[config] Failed to read config/read: ${String((err as Error).message ?? err)}`,
+      );
+    })
+    .finally(() => pendingConfigFetchByBackend.delete(backendKey));
+  pendingConfigFetchByBackend.set(backendKey, promise);
+  await promise;
 }
 
 async function ensureModelsFetched(session: Session): Promise<void> {
@@ -4077,7 +5918,10 @@ async function ensureModelsFetched(session: Session): Promise<void> {
   }
   const promise = backendManager
     .listModelsForSession(session)
-    .then(() => chatView?.refresh())
+    .then(async () => {
+      await ensureConfigFetched(session);
+      chatView?.refresh();
+    })
     .catch((err) => {
       outputChannel?.appendLine(
         `[models] Failed to list models: ${String((err as Error).message ?? err)}`,
@@ -4086,6 +5930,36 @@ async function ensureModelsFetched(session: Session): Promise<void> {
     .finally(() => pendingModelFetchByBackend.delete(backendKey));
   pendingModelFetchByBackend.set(backendKey, promise);
   await promise;
+}
+
+async function ensureCollaborationPresetsFetched(
+  session: Session,
+): Promise<CollaborationModeMask[]> {
+  if (!backendManager) return [];
+  const backendKey = session.backendKey;
+  const cached = collaborationPresetsByBackend.get(backendKey);
+  if (cached) return cached;
+  const pending = pendingCollaborationFetchByBackend.get(backendKey);
+  if (pending) {
+    await pending;
+    return collaborationPresetsByBackend.get(backendKey) ?? [];
+  }
+
+  const promise = backendManager
+    .listCollaborationModePresetsForSession(session)
+    .then((presets) => {
+      collaborationPresetsByBackend.set(backendKey, presets);
+    })
+    .catch((err) => {
+      outputChannel?.appendLine(
+        `[collab] Failed to list collaboration presets: ${String((err as Error)?.message ?? err)}`,
+      );
+      collaborationPresetsByBackend.set(backendKey, []);
+    })
+    .finally(() => pendingCollaborationFetchByBackend.delete(backendKey));
+  pendingCollaborationFetchByBackend.set(backendKey, promise);
+  await promise;
+  return collaborationPresetsByBackend.get(backendKey) ?? [];
 }
 
 function buildChatState(): ChatViewState {
@@ -4117,20 +5991,23 @@ function buildChatState(): ChatViewState {
         .filter(Boolean)
         .join(" • "),
       statusTooltip: globalRateLimitStatusTooltip,
-      cliDefaultModelState: getSessionModelState(null),
+      cliDefaultModelState: getUiDefaultModelState(null),
       modelState: getSessionModelState(null),
       models: null,
+      collaborationModeLabel: null,
       approvals: [],
+      approvalSessionIds: [],
       customPrompts: promptSummaries,
     };
 
-  const tabSessionsRaw = sessions
-    .listAll()
-    .filter((s) => !hiddenTabSessionIds.has(s.id));
+  const tabSessionsRaw = listVisibleTabSessionsOrdered(sessions);
   const runningSessionIds = tabSessionsRaw
     .map((s) => (ensureRuntime(s.id).sending ? s.id : null))
     .filter((v): v is string => typeof v === "string");
   const activeRaw = activeSessionId ? sessions.getById(activeSessionId) : null;
+  const approvalSessionIds = tabSessionsRaw
+    .map((s) => (ensureRuntime(s.id).pendingApprovals.size > 0 ? s.id : null))
+    .filter((v): v is string => typeof v === "string");
   if (!activeRaw)
     return {
       globalBlocks: globalRuntime.blocks,
@@ -4150,9 +6027,11 @@ function buildChatState(): ChatViewState {
         .filter(Boolean)
         .join(" • "),
       statusTooltip: globalRateLimitStatusTooltip,
-      cliDefaultModelState: getSessionModelState(null),
+      cliDefaultModelState: getUiDefaultModelState(null),
       modelState: getSessionModelState(null),
+      collaborationModeLabel: null,
       approvals: [],
+      approvalSessionIds,
       customPrompts: promptSummaries,
     };
 
@@ -4194,20 +6073,29 @@ function buildChatState(): ChatViewState {
     sending: rt.sending,
     reloading: rt.reloading,
     hydrationBlockedText,
-    opencodeDefaultModelKey: backendManager?.getOpencodeDefaultModelKey(activeRaw) ?? null,
+    opencodeDefaultModelKey:
+      backendManager?.getOpencodeDefaultModelKey(activeRaw) ?? null,
+    opencodeDefaultAgentName:
+      backendManager?.getOpencodeDefaultAgentName(activeRaw) ?? null,
     statusText:
       statusText ??
       [globalStatusText, globalRateLimitStatusText].filter(Boolean).join(" • "),
     statusTooltip: statusTooltipParts || null,
-    cliDefaultModelState: getSessionModelState(null),
+    cliDefaultModelState: getUiDefaultModelState(activeRaw),
     modelState: getSessionModelState(activeRaw.id),
     models: getModelOptionsForSession(activeRaw),
+    collaborationModeLabel:
+      activeRaw.collaborationModePresetName &&
+      activeRaw.collaborationModePresetName.trim()
+        ? activeRaw.collaborationModePresetName.trim()
+        : "Default",
     approvals: [...rt.pendingApprovals.entries()].map(([requestKey, v]) => ({
       requestKey,
       title: v.title,
       detail: v.detail,
       canAcceptForSession: v.canAcceptForSession,
     })),
+    approvalSessionIds,
     customPrompts: promptSummaries,
   };
 }
@@ -4239,6 +6127,31 @@ function applyServerNotification(
       return;
     case "thread/started":
       return;
+    case "error": {
+      const p = (n as any).params as {
+        error?: { message?: unknown; additionalDetails?: unknown };
+        willRetry?: unknown;
+        threadId?: unknown;
+        turnId?: unknown;
+      };
+      const message = String(p?.error?.message ?? "").trim();
+      const additionalDetailsRaw = p?.error?.additionalDetails;
+      const additionalDetails =
+        typeof additionalDetailsRaw === "string"
+          ? String(additionalDetailsRaw).trim()
+          : "";
+      const willRetry = Boolean(p?.willRetry ?? false);
+      const turnId = String(p?.turnId ?? "").trim();
+
+      upsertBlock(sessionId, {
+        id: `turn-error:${turnId || newLocalId("error")}`,
+        type: "error",
+        title: willRetry ? "Error (will retry)" : "Error",
+        text: additionalDetails ? `${message}\n\n${additionalDetails}` : message,
+      });
+      chatView?.refresh();
+      return;
+    }
     case "deprecationNotice": {
       const p = (n as any).params as { summary?: unknown; details?: unknown };
       const summary = String(p?.summary ?? "").trim();
@@ -4263,17 +6176,27 @@ function applyServerNotification(
       const blockId = rt.pendingCompactBlockId
         ? rt.pendingCompactBlockId
         : `compacted:${turnId || Date.now()}`;
-      upsertBlock(sessionId, {
+      const divider: ChatBlock = {
         id: blockId,
         type: "divider",
         status: "completed",
         text: `${line}\n• Context compacted`,
-      });
+      };
+      upsertBlock(sessionId, divider);
       // Auto-compaction can happen mid-turn (the backend continues working).
       // In that case, do not unlock the input.
       if (rt.activeTurnId === null) rt.sending = false;
       rt.compactInFlight = false;
       rt.pendingCompactBlockId = null;
+
+      if (shouldClearUiHistoryOnCompact(sessionId)) {
+        const unsafe =
+          rt.activeTurnId !== null ||
+          rt.streamingAssistantItemIds.size > 0 ||
+          rt.pendingAssistantDeltas.size > 0;
+        if (unsafe) rt.clearUiHistoryAfterCompact = true;
+        else clearUiHistoryForCompact(sessionId, rt, divider);
+      }
       chatView?.refresh();
       return;
     }
@@ -4282,6 +6205,21 @@ function applyServerNotification(
       rt.lastTurnStartedAtMs = Date.now();
       rt.lastTurnCompletedAtMs = null;
       rt.activeTurnId = String((n as any).params?.turn?.id ?? "") || null;
+      const binding = resolvePendingLocalUserBlockBinding({
+        activeTurnId: rt.activeTurnId,
+        pendingLocalUserBlockId: rt.pendingLocalUserBlockId,
+      });
+      if (binding.blockIdToBind) {
+        const idx = rt.blockIndexById.get(binding.blockIdToBind);
+        if (idx !== undefined) {
+          const b = rt.blocks[idx];
+          if (b && b.type === "user") {
+            (b as any).turnId = rt.activeTurnId;
+            chatView?.postBlockUpsert(sessionId, b);
+          }
+        }
+      }
+      rt.pendingLocalUserBlockId = binding.nextPendingLocalUserBlockId;
       if (
         rt.pendingInterrupt &&
         rt.activeTurnId &&
@@ -4319,9 +6257,41 @@ function applyServerNotification(
       rt.sending = false;
       rt.lastTurnCompletedAtMs = Date.now();
       rt.activeTurnId = null;
+      rt.pendingLocalUserBlockId = nextPendingLocalUserBlockIdOnTurnCompleted();
       rt.pendingInterrupt = false;
+      {
+        const turn = (n as any).params?.turn as
+          | { id?: unknown; status?: unknown; error?: { message?: unknown; additionalDetails?: unknown } | null }
+          | undefined;
+        const status = String(turn?.status ?? "");
+        if (status === "Failed") {
+          const turnId = String(turn?.id ?? "").trim();
+          const message = String(turn?.error?.message ?? "").trim();
+          const additionalDetailsRaw = turn?.error?.additionalDetails;
+          const additionalDetails =
+            typeof additionalDetailsRaw === "string"
+              ? String(additionalDetailsRaw).trim()
+              : "";
+          if (message) {
+            upsertBlock(sessionId, {
+              id: `turn-error:${turnId || newLocalId("error")}`,
+              type: "error",
+              title: "Turn failed",
+              text: additionalDetails
+                ? `${message}\n\n${additionalDetails}`
+                : message,
+            });
+          }
+        }
+      }
+      // IMPORTANT: clear the streaming set before flushing pending deltas so the webview sees
+      // `streaming=false` for the final append. Otherwise, if messages are delivered out of order
+      // (append after upsert), the webview can get stuck in the <pre> fast-path and skip Markdown
+      // rendering even after the turn completes.
+      const streamingIds = [...rt.streamingAssistantItemIds];
+      rt.streamingAssistantItemIds.clear();
       flushPendingAssistantDeltas(sessionId, rt);
-      for (const id of rt.streamingAssistantItemIds) {
+      for (const id of streamingIds) {
         const idx = rt.blockIndexById.get(id);
         if (idx === undefined) continue;
         const b = rt.blocks[idx];
@@ -4330,10 +6300,21 @@ function applyServerNotification(
           chatView?.postBlockUpsert(sessionId, b);
         }
       }
-      rt.streamingAssistantItemIds.clear();
       markUnreadSession(sessionId);
       sessionPanels?.markTurnCompleted(sessionId);
+
+      if (rt.clearUiHistoryAfterCompact) {
+        const unsafe =
+          rt.streamingAssistantItemIds.size > 0 ||
+          rt.pendingAssistantDeltas.size > 0 ||
+          rt.activeTurnId !== null;
+        if (!unsafe) {
+          rt.clearUiHistoryAfterCompact = false;
+          clearUiHistoryForCompact(sessionId, rt, null);
+        }
+      }
       chatView?.refresh();
+      void flushQueuedUserInput(sessionId);
       return;
     case "thread/tokenUsage/updated":
       rt.tokenUsage = (n as any).params.tokenUsage as ThreadTokenUsage;
@@ -4342,18 +6323,43 @@ function applyServerNotification(
       return;
     case "item/agentMessage/delta": {
       const id = (n as any).params.itemId as string;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
+      // If we receive assistant deltas after the backend claims the turn is completed, keep the
+      // input locked until the item completes. This surfaces an ordering issue without silently
+      // allowing the user to start a new turn while output is still streaming.
+      if (rt.activeTurnId === null && !rt.sending) {
+        outputChannel?.appendLine(
+          `[turn] Received agentMessage delta after turn completed; locking input until item completes: sessionId=${sessionId} itemId=${id}`,
+        );
+        rt.sending = true;
+      }
       const block = getOrCreateBlock(rt, id, () => ({
         id,
         type: "assistant",
         text: "",
+        turnId: turnId ?? undefined,
         streaming: true,
       }));
       const delta = (n as any).params.delta as string;
+      const opencodeSeqRaw = (n as any).params.opencodeSeq as unknown;
+      const opencodeSeq =
+        typeof opencodeSeqRaw === "number" && Number.isFinite(opencodeSeqRaw)
+          ? Math.trunc(opencodeSeqRaw)
+          : null;
       if (block.type === "assistant") {
+        if (turnId) block.turnId = turnId;
         (block as any).streaming = true;
+        if (opencodeSeq !== null) (block as any).opencodeSeq = opencodeSeq;
+        if (!existed) block.text += delta;
       }
       rt.streamingAssistantItemIds.add(id);
       markUnreadSession(sessionId);
+      if (!existed) {
+        sessionPanels?.appendAssistantDelta(sessionId, delta);
+        chatView?.postBlockUpsert(sessionId, block);
+        return;
+      }
       const prev = rt.pendingAssistantDeltas.get(id);
       rt.pendingAssistantDeltas.set(id, prev ? prev + delta : delta);
       scheduleAssistantDeltaFlush(sessionId, rt);
@@ -4361,14 +6367,17 @@ function applyServerNotification(
     }
     case "item/reasoning/summaryTextDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         const p = (n as any).params as { summaryIndex: number; delta: string };
         ensureParts(block.summaryParts, p.summaryIndex);
         block.summaryParts[p.summaryIndex] += p.delta;
@@ -4378,14 +6387,17 @@ function applyServerNotification(
     }
     case "item/reasoning/summaryPartAdded": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         ensureParts(
           block.summaryParts,
           (n as any).params.summaryIndex as number,
@@ -4396,14 +6408,17 @@ function applyServerNotification(
     }
     case "item/reasoning/textDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "reasoning",
         summaryParts: [],
         rawParts: [],
         status: "inProgress",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         const p = (n as any).params as { contentIndex: number; delta: string };
         ensureParts(block.rawParts, p.contentIndex);
         block.rawParts[p.contentIndex] += p.delta;
@@ -4413,7 +6428,9 @@ function applyServerNotification(
     }
     case "item/commandExecution/outputDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "command",
         title: "Command",
@@ -4425,15 +6442,21 @@ function applyServerNotification(
         durationMs: null,
         terminalStdin: [],
         output: "",
+        turnId: turnId ?? undefined,
       }));
       const delta = (n as any).params.delta as string;
-      if (block.type === "command") block.output += delta;
-      chatView?.postBlockAppend(sessionId, id, "commandOutput", delta);
+      if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
+        block.output += delta;
+      }
+      if (!existed) chatView?.postBlockUpsert(sessionId, block);
+      else chatView?.postBlockAppend(sessionId, id, "commandOutput", delta);
       return;
     }
     case "item/commandExecution/terminalInteraction": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "command",
         title: "Command",
@@ -4445,15 +6468,20 @@ function applyServerNotification(
         durationMs: null,
         terminalStdin: [],
         output: "",
+        turnId: turnId ?? undefined,
       }));
-      if (block.type === "command")
+      if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
         block.terminalStdin.push((n as any).params.stdin as string);
+      }
       chatView?.postBlockUpsert(sessionId, block);
       return;
     }
     case "item/fileChange/outputDelta": {
       const id = (n as any).params.itemId as string;
-      const block = getOrCreateBlock(rt, id, () => ({
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
+      const existed = rt.blockIndexById.has(id);
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "fileChange",
         title: "Changes",
@@ -4462,28 +6490,47 @@ function applyServerNotification(
         detail: "",
         hasDiff: rt.latestDiff != null,
         diffs: [],
+        turnId: turnId ?? undefined,
       }));
       const delta = (n as any).params.delta as string;
-      if (block.type === "fileChange") block.detail += delta;
-      if (block.type === "fileChange")
+      if (block.type === "fileChange") {
+        if (turnId) block.turnId = turnId;
+        block.detail += delta;
         block.diffs = diffsForFiles(block.files, rt.latestDiff);
-      chatView?.postBlockAppend(sessionId, id, "fileChangeDetail", delta);
+      }
+      if (!existed) chatView?.postBlockUpsert(sessionId, block);
+      else chatView?.postBlockAppend(sessionId, id, "fileChangeDetail", delta);
       return;
     }
     case "item/mcpToolCall/progress": {
       const id = (n as any).params.itemId as string;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
       const server = String((n as any).params.server ?? "");
-      const block = getOrCreateBlock(rt, id, () => ({
+      const tool = String((n as any).params.tool ?? "");
+      const block = getOrCreateTurnAnchoredBlock(rt, id, turnId, () => ({
         id,
         type: "mcp",
         title: server === "opencode" ? "OpenCode Tool" : "MCP Tool",
         status: "inProgress",
         server,
-        tool: "",
+        tool,
         detail: "",
+        turnId: turnId ?? undefined,
       }));
-      if (block.type === "mcp")
+      const opencodeSeqRaw = (n as any).params.opencodeSeq as unknown;
+      const opencodeSeq =
+        typeof opencodeSeqRaw === "number" && Number.isFinite(opencodeSeqRaw)
+          ? Math.trunc(opencodeSeqRaw)
+          : null;
+      if (block.type === "mcp") {
+        if (turnId) block.turnId = turnId;
+        block.tool = tool;
         block.detail += `${String((n as any).params.message ?? "")}\n`;
+        if (server === "opencode" && opencodeSeq !== null) {
+          (block as any).opencodeSeq = opencodeSeq;
+          (block as any).opencodeOffset = 7;
+        }
+      }
       chatView?.postBlockUpsert(sessionId, block);
       return;
     }
@@ -4499,6 +6546,76 @@ function applyServerNotification(
         .join("\n");
       const text = p.explanation ? `${p.explanation}\n${steps}` : steps;
       upsertBlock(sessionId, { id, type: "plan", title: "Plan", text });
+      chatView?.refresh();
+      return;
+    }
+    case "opencode/permission/asked": {
+      const p = (n as any).params as {
+        requestID?: unknown;
+        permission?: unknown;
+        patterns?: unknown;
+        always?: unknown;
+        metadata?: unknown;
+      };
+      const requestID =
+        typeof p?.requestID === "string"
+          ? p.requestID
+          : String(p?.requestID ?? "");
+      const permission =
+        typeof p?.permission === "string"
+          ? p.permission
+          : String(p?.permission ?? "");
+      if (!requestID.trim() || !permission.trim()) return;
+      const patterns = Array.isArray(p?.patterns)
+        ? (p.patterns as unknown[]).map((x) => String(x ?? "")).filter(Boolean)
+        : [];
+      const always = Array.isArray(p?.always)
+        ? (p.always as unknown[]).map((x) => String(x ?? "")).filter(Boolean)
+        : [];
+      const metadata =
+        typeof p?.metadata === "object" && p.metadata !== null
+          ? (p.metadata as Record<string, unknown>)
+          : null;
+      const id = `opencodePermission:${requestID}`;
+      upsertBlock(sessionId, {
+        id,
+        type: "opencodePermission",
+        requestID,
+        permission,
+        status: "pending",
+        patterns,
+        always,
+        metadata,
+        reply: null,
+        error: null,
+      });
+      chatView?.refresh();
+      return;
+    }
+    case "opencode/permission/replied": {
+      const p = (n as any).params as {
+        requestID?: unknown;
+        reply?: unknown;
+      };
+      const requestID =
+        typeof p?.requestID === "string"
+          ? p.requestID
+          : String(p?.requestID ?? "");
+      const replyRaw =
+        typeof p?.reply === "string" ? p.reply : String(p?.reply ?? "");
+      if (!requestID.trim()) return;
+      const id = `opencodePermission:${requestID}`;
+      const idx = rt.blockIndexById.get(id);
+      if (idx === undefined) return;
+      const b = rt.blocks[idx];
+      if (!b || (b as any).type !== "opencodePermission") return;
+      (b as any).status = "replied";
+      (b as any).reply =
+        replyRaw === "once" || replyRaw === "always" || replyRaw === "reject"
+          ? replyRaw
+          : null;
+      (b as any).error = null;
+      chatView?.postBlockUpsert(sessionId, b as any);
       chatView?.refresh();
       return;
     }
@@ -4596,10 +6713,12 @@ function applyServerNotification(
     case "item/started":
     case "item/completed": {
       const item = (n as any).params.item as ThreadItem;
+      const turnId = String((n as any).params.turnId ?? "").trim() || null;
       applyItemLifecycle(
         rt,
         sessionId,
         String((n as any).params.threadId ?? ""),
+        turnId,
         item,
         n.method === "item/completed",
       );
@@ -4628,31 +6747,40 @@ function applyItemLifecycle(
   rt: SessionRuntime,
   sessionId: string,
   threadId: string,
+  turnId: string | null,
   item: ThreadItem,
   completed: boolean,
 ): void {
   const statusText = completed ? "completed" : "started";
   switch (item.type) {
     case "reasoning": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "reasoning",
         summaryParts: [...item.summary],
         rawParts: [...item.content],
         status: completed ? "completed" : "inProgress",
+        turnId: turnId ?? undefined,
       }));
+      const opencodeSeqRaw = (item as any).opencodeSeq as unknown;
+      const opencodeSeq =
+        typeof opencodeSeqRaw === "number" && Number.isFinite(opencodeSeqRaw)
+          ? Math.trunc(opencodeSeqRaw)
+          : null;
       if (block.type === "reasoning") {
+        if (turnId) block.turnId = turnId;
         block.status = completed ? "completed" : "inProgress";
         if (completed) {
           block.summaryParts = [...item.summary];
           block.rawParts = [...item.content];
         }
+        if (opencodeSeq !== null) (block as any).opencodeSeq = opencodeSeq;
       }
       chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "commandExecution": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "command",
         title: "Command",
@@ -4668,8 +6796,10 @@ function applyItemLifecycle(
         durationMs: item.durationMs,
         terminalStdin: [],
         output: item.aggregatedOutput ?? "",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "command") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.command = item.command;
         block.hideCommandText = shouldHideCommandText(
@@ -4699,7 +6829,7 @@ function applyItemLifecycle(
       const files = item.changes.map((c) =>
         formatPathForSession(c.path, workspaceFolderFsPath),
       );
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "fileChange",
         title: "Changes",
@@ -4708,8 +6838,10 @@ function applyItemLifecycle(
         detail: "",
         hasDiff: true,
         diffs: diffsForFiles(files, rt.latestDiff),
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "fileChange") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.files = files;
         block.hasDiff = true;
@@ -4719,7 +6851,7 @@ function applyItemLifecycle(
       break;
     }
     case "mcpToolCall": {
-      const block = getOrCreateBlock(rt, item.id, () => ({
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "mcp",
         title: item.server === "opencode" ? "OpenCode Tool" : "MCP Tool",
@@ -4727,8 +6859,10 @@ function applyItemLifecycle(
         server: item.server,
         tool: item.tool,
         detail: "",
+        turnId: turnId ?? undefined,
       }));
       if (block.type === "mcp") {
+        if (turnId) block.turnId = turnId;
         block.status = item.status;
         block.server = item.server;
         block.tool = item.tool;
@@ -4736,6 +6870,15 @@ function applyItemLifecycle(
           block.detail += `\nresult: ${JSON.stringify(item.result)}\n`;
         if (completed && item.error)
           block.detail += `\nerror: ${JSON.stringify(item.error)}\n`;
+        const opencodeSeqRaw = (item as any).opencodeSeq as unknown;
+        const opencodeSeq =
+          typeof opencodeSeqRaw === "number" && Number.isFinite(opencodeSeqRaw)
+            ? Math.trunc(opencodeSeqRaw)
+            : null;
+        if (item.server === "opencode" && opencodeSeq !== null) {
+          (block as any).opencodeSeq = opencodeSeq;
+          (block as any).opencodeOffset = 7;
+        }
       }
       chatView?.postBlockUpsert(sessionId, block);
       if (completed && item.result?.content) {
@@ -4748,6 +6891,120 @@ function applyItemLifecycle(
           item.result.content,
         );
       }
+      break;
+    }
+    case "collabAgentToolCall": {
+      const tool = String(item.tool ?? "");
+      const senderThreadId = String(item.senderThreadId ?? "");
+      const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+        ? item.receiverThreadIds.map((id) => String(id))
+        : [];
+      const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
+      const callId = String(item.id ?? "").trim();
+      const agentsStates =
+        item.agentsStates && typeof item.agentsStates === "object"
+          ? (item.agentsStates as Record<
+              string,
+              { status?: string; message?: string | null }
+            >)
+          : {};
+
+      let title = "Sub-agent";
+      const detailLines: string[] = [];
+      if (callId) detailLines.push(`call: ${callId}`);
+      switch (tool) {
+        case "spawnAgent": {
+          title = "Agent spawned";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`agent: ${receiverThreadIds.join(", ")}`);
+          } else {
+            detailLines.push("agent: not created");
+          }
+          break;
+        }
+        case "sendInput": {
+          title = "Input sent";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "wait": {
+          title = item.status === "inProgress" ? "Waiting for agents" : "Wait complete";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "closeAgent": {
+          title = "Agent closed";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        case "resumeAgent": {
+          title = item.status === "inProgress" ? "Resuming agent" : "Agent resumed";
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receiver: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+        default: {
+          if (tool) detailLines.push(`tool: ${tool}`);
+          if (receiverThreadIds.length > 0) {
+            detailLines.push(`receivers: ${receiverThreadIds.join(", ")}`);
+          }
+          break;
+        }
+      }
+
+      if (senderThreadId) detailLines.push(`sender: ${senderThreadId}`);
+
+      const agentStateLines = Object.keys(agentsStates)
+        .sort()
+        .map((id) => {
+          const state = agentsStates[id] ?? {};
+          const status = typeof state.status === "string" ? state.status : "";
+          const message =
+            typeof state.message === "string" ? state.message.trim() : "";
+          if (!status && !message) return "";
+          return message ? `${id}: ${status} - ${message}` : `${id}: ${status}`;
+        })
+        .filter((line) => line.trim().length > 0);
+      if (agentStateLines.length > 0) {
+        detailLines.push("");
+        detailLines.push("agents:");
+        detailLines.push(...agentStateLines);
+      }
+
+      if (prompt) {
+        detailLines.push("");
+        detailLines.push("prompt:");
+        detailLines.push(prompt);
+      }
+
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
+        id: item.id,
+        type: "collab",
+        title,
+        status: item.status,
+        tool,
+        senderThreadId,
+        receiverThreadIds,
+        detail: detailLines.join("\n"),
+        turnId: turnId ?? undefined,
+      }));
+      if (block.type === "collab") {
+        if (turnId) block.turnId = turnId;
+        block.title = title;
+        block.status = item.status;
+        block.tool = tool;
+        block.senderThreadId = senderThreadId;
+        block.receiverThreadIds = receiverThreadIds;
+        block.detail = detailLines.join("\n");
+      }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "webSearch": {
@@ -4776,12 +7033,19 @@ function applyItemLifecycle(
         }
       }
 
-      upsertBlock(sessionId, {
+      const block = getOrCreateTurnAnchoredBlock(rt, item.id, turnId, () => ({
         id: item.id,
         type: "webSearch",
         query: item.query,
         status: completed ? "completed" : "inProgress",
-      });
+        turnId: turnId ?? undefined,
+      }));
+      if (block.type === "webSearch") {
+        if (turnId) block.turnId = turnId;
+        block.query = item.query;
+        block.status = completed ? "completed" : "inProgress";
+      }
+      chatView?.postBlockUpsert(sessionId, block);
       break;
     }
     case "imageView": {
@@ -4812,9 +7076,25 @@ function applyItemLifecycle(
         id,
         type: "assistant",
         text: "",
+        turnId: turnId ?? undefined,
         streaming: !completed,
       }));
       if (block.type === "assistant") {
+        if (turnId) block.turnId = turnId;
+        if (completed) {
+          // If the "completed" item arrives before the pending delta flush runs, drop the
+          // pending delta buffer for this item. The completed payload already contains the
+          // full text, and applying pending deltas afterwards would duplicate suffixes.
+          const removed = rt.pendingAssistantDeltas.delete(id);
+          if (
+            removed &&
+            rt.pendingAssistantDeltas.size === 0 &&
+            rt.pendingAssistantDeltaFlushTimer
+          ) {
+            clearTimeout(rt.pendingAssistantDeltaFlushTimer);
+            rt.pendingAssistantDeltaFlushTimer = null;
+          }
+        }
         if (completed && typeof (item as any).text === "string") {
           block.text = String((item as any).text);
         }
@@ -4827,6 +7107,13 @@ function applyItemLifecycle(
       }
       if (completed) rt.streamingAssistantItemIds.delete(id);
       else rt.streamingAssistantItemIds.add(id);
+
+      // If we previously re-locked the input due to late deltas, unlock once all assistant
+      // messages have completed and there is no active turn.
+      if (completed && rt.activeTurnId === null && rt.streamingAssistantItemIds.size === 0) {
+        rt.sending = false;
+        rt.lastTurnCompletedAtMs = Date.now();
+      }
       chatView?.postBlockUpsert(sessionId, block);
       break;
     }
@@ -4848,7 +7135,9 @@ function applyItemLifecycle(
           const existing =
             idx !== undefined ? (rt.blocks[idx] as any) : (null as any);
           const toolCount =
-            existing && existing.type === "step" && Array.isArray(existing.tools)
+            existing &&
+            existing.type === "step" &&
+            Array.isArray(existing.tools)
               ? existing.tools.length
               : 0;
 
@@ -4865,10 +7154,14 @@ function applyItemLifecycle(
                 ? (anyItem.tokens as any)
                 : null;
             const parts: string[] = [];
-            if (typeof anyItem.cost === "number" && Number.isFinite(anyItem.cost))
+            if (
+              typeof anyItem.cost === "number" &&
+              Number.isFinite(anyItem.cost)
+            )
               parts.push(`cost=${String(anyItem.cost)}`);
             if (tokens) {
-              if (typeof tokens.input === "number") parts.push(`in=${String(tokens.input)}`);
+              if (typeof tokens.input === "number")
+                parts.push(`in=${String(tokens.input)}`);
               if (typeof tokens.output === "number")
                 parts.push(`out=${String(tokens.output)}`);
               if (typeof tokens.reasoning === "number")
@@ -4949,7 +7242,9 @@ function applyItemLifecycle(
                 ? String(anyItem.snapshot)
                 : null,
             reason:
-              typeof anyItem.reason === "string" ? String(anyItem.reason) : null,
+              typeof anyItem.reason === "string"
+                ? String(anyItem.reason)
+                : null,
             cost:
               typeof anyItem.cost === "number" && Number.isFinite(anyItem.cost)
                 ? Number(anyItem.cost)
@@ -4957,6 +7252,12 @@ function applyItemLifecycle(
             tokens,
             tools: [],
           }));
+          const opencodeSeqRaw = anyItem.opencodeSeq as unknown;
+          const opencodeSeq =
+            typeof opencodeSeqRaw === "number" &&
+            Number.isFinite(opencodeSeqRaw)
+              ? Math.trunc(opencodeSeqRaw)
+              : null;
           if (block.type === "step") {
             block.status = status;
             block.snapshot =
@@ -4964,12 +7265,15 @@ function applyItemLifecycle(
                 ? String(anyItem.snapshot)
                 : null;
             block.reason =
-              typeof anyItem.reason === "string" ? String(anyItem.reason) : null;
+              typeof anyItem.reason === "string"
+                ? String(anyItem.reason)
+                : null;
             block.cost =
               typeof anyItem.cost === "number" && Number.isFinite(anyItem.cost)
                 ? Number(anyItem.cost)
                 : null;
             block.tokens = tokens;
+            if (opencodeSeq !== null) (block as any).opencodeSeq = opencodeSeq;
           }
           chatView?.postBlockUpsert(sessionId, block);
           break;
@@ -4999,6 +7303,14 @@ function applyItemLifecycle(
             tools: [],
           }));
           if (container.type !== "step") break;
+          const opencodeSeqRaw = anyItem.opencodeSeq as unknown;
+          const opencodeSeq =
+            typeof opencodeSeqRaw === "number" &&
+            Number.isFinite(opencodeSeqRaw)
+              ? Math.trunc(opencodeSeqRaw)
+              : null;
+          if (opencodeSeq !== null)
+            (container as any).opencodeSeq = opencodeSeq;
 
           const status =
             anyItem.status === "completed"
@@ -5057,6 +7369,274 @@ function applyItemLifecycle(
           }
 
           chatView?.postBlockUpsert(sessionId, container);
+          break;
+        }
+
+        const opencodeSeqRaw = anyItem?.opencodeSeq as unknown;
+        const opencodeSeq =
+          typeof opencodeSeqRaw === "number" && Number.isFinite(opencodeSeqRaw)
+            ? Math.trunc(opencodeSeqRaw)
+            : null;
+        const setOpencodeOrdering = (block: ChatBlock): void => {
+          if (opencodeSeq === null) return;
+          (block as any).opencodeSeq = opencodeSeq;
+          // Place opencode "part" cards between Step and Assistant for the same message.
+          (block as any).opencodeOffset = 7;
+        };
+
+        const upsertOpencodeInfo = (args: {
+          id: string;
+          title: string;
+          text: string;
+        }): void => {
+          const block = getOrCreateBlock(rt, args.id, () => ({
+            id: args.id,
+            type: "info",
+            title: args.title,
+            text: args.text,
+          }));
+          if (block.type !== "info") return;
+          block.title = args.title;
+          block.text = args.text;
+          setOpencodeOrdering(block);
+          chatView?.postBlockUpsert(sessionId, block);
+        };
+
+        if (anyItem?.type === "opencodeFile") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const role =
+            typeof anyItem.role === "string" && anyItem.role.trim()
+              ? (String(anyItem.role).trim() as any)
+              : null;
+          const filename =
+            typeof anyItem.filename === "string" && anyItem.filename.trim()
+              ? String(anyItem.filename).trim()
+              : null;
+          const mime =
+            typeof anyItem.mime === "string" && anyItem.mime.trim()
+              ? String(anyItem.mime).trim()
+              : null;
+          const url =
+            typeof anyItem.url === "string" && anyItem.url.trim()
+              ? String(anyItem.url).trim()
+              : null;
+
+          const isImage = Boolean(mime && mime.startsWith("image/"));
+          const isDataUrl = Boolean(url && url.startsWith("data:"));
+          if (isImage && isDataUrl && url) {
+            const imageBlockId = `opencodeFileImage:${id}`;
+            if (!rt.blockIndexById.has(imageBlockId)) {
+              void (async () => {
+                try {
+                  const cached = await cacheImageDataUrl({
+                    prefix: `opencode-file-${sessionId}-${id}`,
+                    dataUrl: url,
+                  });
+                  const block: ChatBlock = {
+                    id: imageBlockId,
+                    type: "image",
+                    title: filename ?? "Attached image",
+                    src: "",
+                    imageKey: cached.imageKey,
+                    mimeType: cached.mimeType,
+                    byteLength: cached.byteLength,
+                    autoLoad: true,
+                    alt: filename ?? "image",
+                    caption: filename,
+                    role: role === "assistant" ? "assistant" : "user",
+                  };
+                  (block as any).opencodeSeq = opencodeSeq;
+                  (block as any).opencodeOffset = 7;
+                  upsertBlock(sessionId, block);
+                  chatView?.postBlockUpsert(sessionId, block);
+                  chatView?.refresh();
+                  schedulePersistRuntime(sessionId);
+                } catch (err) {
+                  outputChannel?.appendLine(
+                    `[opencode] failed to cache file part image: ${String(err)}`,
+                  );
+                }
+              })();
+            }
+            break;
+          }
+
+          const displayUrl = (() => {
+            if (!url) return null;
+            if (url.startsWith("data:")) return "(data URL omitted)";
+            return url.length > 200 ? `${url.slice(0, 200)}…` : url;
+          })();
+          const lines: string[] = [];
+          lines.push(filename ? `**${filename}**` : "**File**");
+          if (mime) lines.push(`- mime: \`${mime}\``);
+          if (displayUrl) lines.push(`- url: ${displayUrl}`);
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode File",
+            text: lines.join("\n"),
+          });
+          break;
+        }
+
+        if (anyItem?.type === "opencodePatch") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const hash =
+            typeof anyItem.hash === "string" && anyItem.hash.trim()
+              ? String(anyItem.hash).trim()
+              : null;
+          const files = Array.isArray(anyItem.files)
+            ? (anyItem.files as unknown[])
+                .map((x) => String(x ?? ""))
+                .filter(Boolean)
+            : [];
+          const lines: string[] = [];
+          lines.push(hash ? `hash: \`${hash.slice(0, 12)}\`` : "hash: —");
+          if (files.length > 0) {
+            lines.push("");
+            lines.push("files:");
+            for (const f of files) lines.push(`- ${f}`);
+          }
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode Patch",
+            text: lines.join("\n"),
+          });
+          break;
+        }
+
+        if (anyItem?.type === "opencodeAgent") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const name =
+            typeof anyItem.name === "string" && anyItem.name.trim()
+              ? String(anyItem.name).trim()
+              : "agent";
+          const source =
+            typeof anyItem.source === "object" && anyItem.source !== null
+              ? (anyItem.source as any)
+              : null;
+          const lines: string[] = [];
+          lines.push(`name: \`${name}\``);
+          if (typeof source?.value === "string" && source.value.trim()) {
+            const start =
+              typeof source.start === "number"
+                ? Math.trunc(source.start)
+                : null;
+            const end =
+              typeof source.end === "number" ? Math.trunc(source.end) : null;
+            const range =
+              start !== null && end !== null ? ` (${start}-${end})` : "";
+            lines.push("");
+            lines.push(`source${range}:`);
+            lines.push("```");
+            lines.push(String(source.value).trimEnd());
+            lines.push("```");
+          }
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode Agent",
+            text: lines.join("\n"),
+          });
+          break;
+        }
+
+        if (anyItem?.type === "opencodeSnapshot") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const snapshot =
+            typeof anyItem.snapshot === "string" && anyItem.snapshot.trim()
+              ? String(anyItem.snapshot).trim()
+              : null;
+          const text = snapshot
+            ? `snapshot: \`${snapshot.slice(0, 12)}\``
+            : "snapshot: —";
+          upsertOpencodeInfo({ id, title: "OpenCode Snapshot", text });
+          break;
+        }
+
+        if (anyItem?.type === "opencodeRetry") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const attempt =
+            typeof anyItem.attempt === "number" &&
+            Number.isFinite(anyItem.attempt)
+              ? Math.trunc(anyItem.attempt)
+              : 1;
+          const err =
+            typeof anyItem.error === "string" && anyItem.error.trim()
+              ? String(anyItem.error).trim()
+              : "Retry";
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode Retry",
+            text: `attempt: \`${String(attempt)}\`\nerror: ${err}`,
+          });
+          break;
+        }
+
+        if (anyItem?.type === "opencodeCompaction") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const auto = Boolean(anyItem.auto);
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode Compaction",
+            text: `auto: \`${auto ? "true" : "false"}\``,
+          });
+          break;
+        }
+
+        if (anyItem?.type === "opencodeSubtask") {
+          const id = String(anyItem.id ?? "");
+          if (!id) break;
+          const description =
+            typeof anyItem.description === "string" &&
+            anyItem.description.trim()
+              ? String(anyItem.description).trim()
+              : null;
+          const agent =
+            typeof anyItem.agent === "string" && anyItem.agent.trim()
+              ? String(anyItem.agent).trim()
+              : null;
+          const model =
+            typeof anyItem.model === "object" && anyItem.model !== null
+              ? (anyItem.model as any)
+              : null;
+          const command =
+            typeof anyItem.command === "string" && anyItem.command.trim()
+              ? String(anyItem.command).trim()
+              : null;
+          const prompt =
+            typeof anyItem.prompt === "string" && anyItem.prompt.trim()
+              ? String(anyItem.prompt).trim()
+              : null;
+          const lines: string[] = [];
+          if (description) lines.push(`**${description}**`);
+          if (agent) lines.push(`- agent: \`${agent}\``);
+          if (
+            model &&
+            typeof model.providerID === "string" &&
+            typeof model.modelID === "string"
+          ) {
+            lines.push(
+              `- model: \`${String(model.providerID)}/${String(model.modelID)}\``,
+            );
+          }
+          if (command) lines.push(`- command: \`${command}\``);
+          if (prompt) {
+            lines.push("");
+            lines.push("prompt:");
+            lines.push("```");
+            lines.push(prompt);
+            lines.push("```");
+          }
+          upsertOpencodeInfo({
+            id,
+            title: "OpenCode Subtask",
+            text: lines.join("\n").trim(),
+          });
           break;
         }
       }
@@ -5177,6 +7757,22 @@ function getOrCreateBlock(
   return rt.blocks[idx]!;
 }
 
+function getOrCreateTurnAnchoredBlock(
+  rt: SessionRuntime,
+  id: string,
+  turnId: string | null,
+  create: () => ChatBlock,
+): ChatBlock {
+  const idx = rt.blockIndexById.get(id);
+  if (idx !== undefined) return rt.blocks[idx]!;
+
+  void turnId;
+  const block = create();
+  rt.blockIndexById.set(id, rt.blocks.length);
+  rt.blocks.push(block);
+  return block;
+}
+
 function rebuildBlockIndex(rt: SessionRuntime): void {
   rt.blockIndexById.clear();
   for (let i = 0; i < rt.blocks.length; i++) {
@@ -5204,6 +7800,84 @@ function purgeLegacyToolBlocks(rt: SessionRuntime): void {
 
 function newLocalId(prefix: string): string {
   return `${prefix}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+}
+
+function shouldClearUiHistoryOnCompact(sessionId: string): boolean {
+  if (!sessions) return false;
+  const session = sessions.getById(sessionId);
+  if (!session) return false;
+  try {
+    const wk = vscode.Uri.parse(session.workspaceFolderUri);
+    const cfg = vscode.workspace.getConfiguration("codez", wk);
+    return cfg.get<boolean>("ui.clearHistoryOnCompact") ?? false;
+  } catch {
+    return false;
+  }
+}
+
+function keepUiHistoryPairsOnCompact(sessionId: string): number {
+  if (!sessions) return 10;
+  const session = sessions.getById(sessionId);
+  if (!session) return 10;
+  try {
+    const wk = vscode.Uri.parse(session.workspaceFolderUri);
+    const cfg = vscode.workspace.getConfiguration("codez", wk);
+    const raw = cfg.get<number>("ui.clearHistoryOnCompactKeepPairs") ?? 10;
+    if (!Number.isFinite(raw)) return 10;
+    return Math.max(0, Math.trunc(raw));
+  } catch {
+    return 10;
+  }
+}
+
+function clearUiHistoryForCompact(
+  sessionId: string,
+  rt: SessionRuntime,
+  divider: ChatBlock | null,
+): void {
+  const keepPairs = keepUiHistoryPairsOnCompact(sessionId);
+
+  // Keep recent conversation (user/assistant) blocks only, dropping tool/output blocks to reduce memory.
+  let startIdx = 0;
+  if (keepPairs > 0) {
+    let seenUsers = 0;
+    for (let i = rt.blocks.length - 1; i >= 0; i -= 1) {
+      const b = rt.blocks[i];
+      if (!b) continue;
+      if (b.type !== "user") continue;
+      seenUsers += 1;
+      if (seenUsers >= keepPairs) {
+        startIdx = i;
+        break;
+      }
+    }
+  } else {
+    startIdx = rt.blocks.length;
+  }
+
+  const conversation = rt.blocks
+    .slice(startIdx)
+    .filter((b) => b && (b.type === "user" || b.type === "assistant"));
+
+  const next: ChatBlock[] = [];
+  if (divider) next.push(divider);
+  next.push(...conversation);
+  next.push({
+    id: newLocalId("uiCleared"),
+    type: "system",
+    title: "History trimmed",
+    text:
+      keepPairs > 0
+        ? `Context was compacted. To reduce memory usage, the UI history was trimmed (keeping the last ${keepPairs} exchanges).\nUse 'Load history' to re-hydrate if needed.`
+        : "Context was compacted. To reduce memory usage, the UI history was trimmed.\nUse 'Load history' to re-hydrate if needed.",
+  });
+
+  rt.blocks = next;
+  rebuildBlockIndex(rt);
+  rt.uiHydrationBlockedText =
+    keepPairs > 0
+      ? `Context was compacted. To reduce memory usage, the UI history was trimmed (keeping the last ${keepPairs} exchanges).\nClick 'Load history' to re-hydrate.`
+      : "Context was compacted. To reduce memory usage, the UI history was trimmed.\nClick 'Load history' to re-hydrate.";
 }
 
 function ensureParts(parts: string[], index: number): void {
@@ -5251,10 +7925,19 @@ function formatTokenUsageStatus(tokenUsage: ThreadTokenUsage): string {
   return `tokens used=${formatK(total.totalTokens)}`;
 }
 
-function isImageContent(block: ContentBlock): block is ImageContent {
+function isContentBlock(value: unknown): value is ContentBlock {
   return (
-    typeof (block as ImageContent).data === "string" &&
-    typeof (block as ImageContent).mimeType === "string"
+    Boolean(value) &&
+    typeof value === "object" &&
+    typeof (value as { type?: unknown }).type === "string"
+  );
+}
+
+function isImageContent(value: unknown): value is ImageContent {
+  return (
+    isContentBlock(value) &&
+    typeof (value as ImageContent).data === "string" &&
+    typeof (value as ImageContent).mimeType === "string"
   );
 }
 
@@ -5337,9 +8020,10 @@ async function appendMcpImageBlocks(
   itemId: string,
   server: string,
   tool: string,
-  content: ContentBlock[],
+  content: unknown,
 ): Promise<void> {
-  const images = content.filter(isImageContent);
+  const blocks = Array.isArray(content) ? content.filter(isContentBlock) : [];
+  const images = blocks.filter(isImageContent);
   if (images.length === 0) return;
   const cached: Array<{
     imageKey: string;
@@ -5453,114 +8137,6 @@ function formatParamsForDisplay(params: unknown): string {
   const limit = 10_000;
   if (json.length <= limit) return json;
   return `${json.slice(0, limit)}\n...(truncated ${json.length - limit} chars)`;
-}
-
-function formatAskUserQuestionSummary(
-  request: AskUserQuestionRequest,
-  response: AskUserQuestionResponse,
-): string {
-  const title =
-    typeof (request as any)?.title === "string" && (request as any).title.trim()
-      ? String((request as any).title).trim()
-      : "Codex question";
-
-  const answers =
-    typeof (response as any)?.answers === "object" &&
-    (response as any).answers !== null
-      ? ((response as any).answers as Record<string, unknown>)
-      : {};
-
-  const questions = Array.isArray((request as any)?.questions)
-    ? ((request as any).questions as Array<any>)
-    : [];
-
-  const lines: string[] = [];
-  lines.push(`**${title}**`);
-  if ((response as any)?.cancelled) lines.push("_Cancelled_");
-  lines.push("");
-
-  for (const q of questions) {
-    const id = typeof q?.id === "string" ? q.id : null;
-    const prompt = typeof q?.prompt === "string" ? q.prompt : null;
-    if (!id || !prompt) continue;
-
-    const rawAnswer = answers[id];
-    const optLabelByValue = new Map<string, string>();
-    const rawOptions = Array.isArray(q?.options) ? (q.options as any[]) : [];
-    for (const opt of rawOptions) {
-      const value = typeof opt?.value === "string" ? opt.value : null;
-      const label = typeof opt?.label === "string" ? opt.label : null;
-      if (value && label) optLabelByValue.set(value, label);
-    }
-
-    const allowOther = Boolean(q?.allow_other);
-    const questionType = typeof q?.type === "string" ? q.type : null;
-
-    lines.push(`- **${prompt}**`);
-
-    if (questionType === "single_select" || questionType === "multi_select") {
-      const optionValues = new Set<string>(optLabelByValue.keys());
-
-      const selectedValues: string[] = (() => {
-        if (rawAnswer === null || rawAnswer === undefined) return [];
-        if (Array.isArray(rawAnswer)) return rawAnswer.map((v) => String(v));
-        return [String(rawAnswer)];
-      })();
-
-      const selectedOptionValues = new Set<string>(
-        selectedValues.filter((v) => optionValues.has(v)),
-      );
-      const selectedOtherValues = selectedValues
-        .filter((v) => !optionValues.has(v))
-        .map((v) => v.trim())
-        .filter(Boolean);
-
-      for (const opt of rawOptions) {
-        const value = typeof opt?.value === "string" ? opt.value : null;
-        const label = typeof opt?.label === "string" ? opt.label : null;
-        if (!value || !label) continue;
-        const checked = selectedOptionValues.has(value) ? "x" : " ";
-        lines.push(`  - [${checked}] ${label}`);
-      }
-
-      if (allowOther) {
-        const checked = selectedOtherValues.length > 0 ? "x" : " ";
-        const other =
-          selectedOtherValues.length > 0
-            ? `: ${selectedOtherValues.join(", ")}`
-            : "";
-        lines.push(`  - [${checked}] Other…${other}`);
-      }
-
-      if (
-        rawOptions.length === 0 &&
-        selectedValues.length > 0 &&
-        selectedOtherValues.length > 0
-      ) {
-        lines.push(`  - Answer: ${selectedOtherValues.join(", ")}`);
-      }
-
-      if (selectedValues.length === 0) lines.push("  - _No selection_");
-      continue;
-    }
-
-    const rendered = (() => {
-      if (rawAnswer === null || rawAnswer === undefined) return "—";
-      if (Array.isArray(rawAnswer)) {
-        const parts = rawAnswer
-          .map((v) => String(v))
-          .map((s) => s.trim())
-          .filter(Boolean);
-        return parts.length > 0 ? parts.join(", ") : "—";
-      }
-      const s = String(rawAnswer).trim();
-      return s ? s : "—";
-    })();
-
-    lines.push(`  - Answer: ${rendered}`);
-  }
-
-  return lines.join("\n").trim();
 }
 
 function removeGlobalWhere(pred: (b: ChatBlock) => boolean): void {
@@ -5726,15 +8302,15 @@ function applyGlobalNotification(
         const mins = p.windowDurationMins ?? null;
         const label = mins ? rateLimitShortLabelFromMinutes(mins) : "primary";
         parts.push(`${label}:${formatPercent2(p.usedPercent)}%`);
-        const reset = p.resetsAt ? formatResetsAtTooltip(p.resetsAt) : "不明";
-        tooltipLines.push(`${label} リセット: ${reset}`);
+        const reset = p.resetsAt ? formatResetsAtTooltip(p.resetsAt) : "unknown";
+        tooltipLines.push(`${label} reset: ${reset}`);
       }
       if (s) {
         const mins = s.windowDurationMins ?? null;
         const label = mins ? rateLimitShortLabelFromMinutes(mins) : "secondary";
         parts.push(`${label}:${formatPercent2(s.usedPercent)}%`);
-        const reset = s.resetsAt ? formatResetsAtTooltip(s.resetsAt) : "不明";
-        tooltipLines.push(`${label} リセット: ${reset}`);
+        const reset = s.resetsAt ? formatResetsAtTooltip(s.resetsAt) : "unknown";
+        tooltipLines.push(`${label} reset: ${reset}`);
       }
       globalRateLimitStatusText = parts.length > 0 ? parts.join(" ") : null;
       globalRateLimitStatusTooltip =
@@ -5798,24 +8374,33 @@ function applyGlobalNotification(
     }
     case "sessionConfigured": {
       const p = (n as any).params as Record<string, unknown>;
+      // Do not overwrite the model selector with the backend's effective model.
+      // The selector represents user overrides (explicit picks) vs "default" (config-driven).
+      // If we set it here, the UI looks like it forced a specific model even when the user
+      // is relying on config.toml defaults.
+      //
+      // However, older versions of this extension accidentally wrote the backend's effective
+      // model into the selector state. If we can map this notification back to a session and
+      // the user hasn't explicitly overridden the model, clear that stale state so "default"
+      // behaves as expected.
       const threadId =
         typeof (p as any).sessionId === "string"
           ? ((p as any).sessionId as string)
-          : null;
-      const model =
-        typeof (p as any).model === "string"
-          ? ((p as any).model as string)
-          : null;
-      const reasoning =
-        typeof (p as any).reasoningEffort === "string"
-          ? ((p as any).reasoningEffort as string)
           : null;
       const session =
         threadId && sessions
           ? sessions.getByThreadId(backendKey, threadId)
           : null;
-      if (session && model) {
-        setSessionModelState(session.id, { model, provider: null, reasoning });
+      if (session && !isSessionModelOverrideExplicit(session.id)) {
+        const st = getSessionModelState(session.id);
+        if (st.model || st.provider || st.reasoning || st.agent) {
+          setSessionModelState(session.id, {
+            model: null,
+            provider: null,
+            reasoning: null,
+            agent: null,
+          });
+        }
       }
       upsertGlobal({
         id: newLocalId("sessionConfigured"),
@@ -6144,7 +8729,9 @@ function applyCodexEvent(
     type !== "turn_aborted" &&
     type !== "mcp_startup_complete" &&
     type !== "mcp_startup_update" &&
-    type !== "list_custom_prompts_response"
+    type !== "list_custom_prompts_response" &&
+    type !== "skills_update_available" &&
+    type !== "skillsUpdateAvailable"
   ) {
     return;
   }
@@ -6174,6 +8761,36 @@ function applyCodexEvent(
       .filter((p) => !!p.name)
       .map((p) => ({ ...p, source: "server" as const }));
     setCustomPrompts(next);
+    return;
+  }
+
+  if (type === "skills_update_available" || type === "skillsUpdateAvailable") {
+    chatView?.invalidateSkillIndex(sessionId);
+    if (backendManager) {
+      const session = sessions?.getById(sessionId) ?? null;
+      if (session) {
+        void backendManager
+          .listSkillsForSession(session, { forceReload: true })
+          .then((entries) => {
+            const entry = entries[0] ?? null;
+            const skills = entry?.skills ?? [];
+            chatView?.postSkillIndex(
+              session.id,
+              skills.map((s) => ({
+                name: s.name,
+                description: s.description,
+                scope: s.scope,
+                path: s.path,
+              })),
+            );
+          })
+          .catch((err) => {
+            outputChannel?.appendLine(
+              `[skills] Failed to refresh skills after update: ${String(err)}`,
+            );
+          });
+      }
+    }
     return;
   }
 
@@ -6390,6 +9007,7 @@ function hydrateRuntimeFromThread(
       case "command":
       case "fileChange":
       case "mcp":
+      case "collab":
       case "step":
       case "webSearch":
       case "reasoning":
@@ -6418,13 +9036,19 @@ function hydrateRuntimeFromThread(
   const turns: Turn[] = Array.isArray(thread.turns) ? thread.turns : [];
   for (const turn of turns) {
     for (const item of turn.items ?? []) {
-      applyItemLifecycle(rt, sessionId, thread.id, item, true);
+      applyItemLifecycle(rt, sessionId, thread.id, turn.id, item, true);
       if (item.type === "userMessage") {
         const text = item.content
           .filter((c) => c.type === "text")
           .map((c) => c.text)
           .join("\n");
-        if (text) upsertBlock(sessionId, { id: item.id, type: "user", text });
+        if (text)
+          upsertBlock(sessionId, {
+            id: item.id,
+            type: "user",
+            text,
+            turnId: turn.id,
+          });
       }
       if (item.type === "agentMessage") {
         if (item.text)
@@ -6432,6 +9056,7 @@ function hydrateRuntimeFromThread(
             id: item.id,
             type: "assistant",
             text: item.text,
+            turnId: turn.id,
             streaming: false,
           });
       }
@@ -6543,6 +9168,8 @@ type PersistedSessionV2 = Pick<
   | "title"
   | "threadId"
   | "customTitle"
+  | "personality"
+  | "collaborationModePresetName"
 >;
 
 function readPersistedSessionsV1(
@@ -6598,6 +9225,8 @@ function loadSessions(
     const title = o["title"];
     const customTitle = o["customTitle"];
     const threadId = o["threadId"];
+    const personality = o["personality"];
+    const collaborationModePresetName = o["collaborationModePresetName"];
 
     if (
       typeof id !== "string" ||
@@ -6612,6 +9241,16 @@ function loadSessions(
       continue;
     }
 
+    const personalityVal: Personality | null =
+      personality === "friendly" || personality === "pragmatic"
+        ? personality
+        : null;
+    const collaborationModePresetNameVal =
+      typeof collaborationModePresetName === "string" &&
+      collaborationModePresetName.trim()
+        ? collaborationModePresetName.trim()
+        : null;
+
     store.add(backendKey, {
       id,
       backendKey,
@@ -6620,6 +9259,8 @@ function loadSessions(
       title,
       customTitle: typeof customTitle === "boolean" ? customTitle : false,
       threadId,
+      personality: personalityVal,
+      collaborationModePresetName: collaborationModePresetNameVal,
     });
   }
 }
@@ -6643,6 +9284,8 @@ function toPersistedSessionV2(session: Session): PersistedSessionV2 {
     title,
     customTitle,
     threadId,
+    personality,
+    collaborationModePresetName,
   } = session;
   return {
     id,
@@ -6652,6 +9295,8 @@ function toPersistedSessionV2(session: Session): PersistedSessionV2 {
     title,
     customTitle,
     threadId,
+    personality: personality ?? null,
+    collaborationModePresetName: collaborationModePresetName ?? null,
   };
 }
 

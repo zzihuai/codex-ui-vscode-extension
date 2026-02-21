@@ -17,12 +17,16 @@ function main() {
   console.log(`[regen-protocol] codexBin=${codexBin}`);
   console.log(`[regen-protocol] outDir=${outDir}`);
 
-  execFileSync(codexBin, ["app-server", "generate-ts", "--out", outDir], {
-    stdio: "inherit",
-  });
   execFileSync(
     codexBin,
-    ["app-server", "generate-json-schema", "--out", outDir],
+    ["app-server", "generate-ts", "--experimental", "--out", outDir],
+    {
+      stdio: "inherit",
+    },
+  );
+  execFileSync(
+    codexBin,
+    ["app-server", "generate-json-schema", "--experimental", "--out", outDir],
     {
       stdio: "inherit",
     },

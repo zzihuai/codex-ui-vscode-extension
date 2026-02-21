@@ -4,7 +4,136 @@
 
 ## Unreleased
 
-（なし）
+_No unreleased changes yet._
+
+## 0.2.13
+
+- **Sub-agent UI**
+  - `collabAgentToolCall` を tool別に表示し、`spawn/wait/close/resume/send` の見出しを専用化（例: `Agent spawned`, `Waiting for agents`, `Agent resumed`）
+  - Sub-agent ブロック本文に `call`, `receiver(s)`, `sender`, `agents` 状態, `prompt` を整理して表示
+- **Steer / Queue UI**
+  - 実行中ターンの追加入力を専用UIに分離し、入力欄上に `Steer send` / `Queue next` ボタンを表示
+  - 実行中に Enter を押した場合は新規 `turn/start` ではなく `Steer send` と同等の送信に変更
+  - `Tab` による暗黙の queue 送信を廃止し、`Queue next` ボタンからのみキュー投入する挙動へ変更
+- **Steer transport (codez/codex)**
+  - `turn/steer` RPC を追加実装し、実行中ターンへ追加入力を送信可能に
+  - steer 送信時の user ブロックに実行中 `turnId` を紐付けてチャット履歴へ反映
+  - steer 失敗時に入力欄テキストを消さず、再送できるように修正
+  - steer 失敗時に未送信 user ブロックが履歴へ残る問題を修正（成功時のみ反映）
+  - steer 送信不可条件（実行ターンなし等）を失敗応答として返すよう修正し、UIが成功扱いで入力を消してしまう問題を修正
+  - steer の user ブロックを「送信時点の位置」に挿入し、最終応答が末尾に出ない並び崩れを軽減
+- **Ordering**
+  - OpenCode の同一 `opencodeSeq` 内で `command/fileChange/webSearch` を `assistant` より先に並べるよう調整
+  - codez/codex の同一 `turnId` 内で tool 系ブロック（command/fileChange/mcp/collab/reasoning/webSearch）の初回挿入位置を `assistant` より前に固定し、`item/completed` 初見時に末尾へ落ちる問題を修正
+  - `item/agentMessage/delta` 初回受信時に assistant ブロックを即時 upsert してから delta を反映し、未生成ブロックへの append が捨てられて assistant が末尾に固まる問題を修正
+  - tool/reasoning/assistant の並びを `turnId` アンカー依存から `itemId` 初回観測順（到着順）に統一し、1ターン内で assistant が複数ある場合の不自然な再配置を修正
+
+## 0.2.10
+
+- **Sessions / Tree**
+  - backend（`codez (N)` 等）のグルーピング行を廃止し、各セッション行に `backendId` と `threadId` を同一行で表示
+- **Sessions / Chat Tabs**
+  - Reload 後など履歴未ロードのセッションで、CHAT タブをクリックしたときに履歴ロード（`Load history` 相当）を実行するよう改善
+  - 既存セッションに `turnId` なしの user ブロックが残っている場合、`codez/opencode` では履歴再hydrationを強制して Rewind/Edit を復旧
+  - `thread/resume` は毎回実行せず、履歴が既にロード済みのときはスキップ（上記の復旧条件のみ例外）
+  - セッション切替時の `reloadSession` で、他セッションが実行中なら reload を拒否して進行中ストリームへの干渉を回避
+- **Collaboration Mode**
+  - Windows での誤爆を避けるため、`Ctrl+Shift` によるモード切替を廃止し、入力欄での `Shift+Tab` 切替のみ対応に変更
+- **Steer Mode**
+  - 実行中ターンでも `Enter` 送信を許可し、`Tab` で次メッセージをキュー投入して完了後に自動送信する挙動を追加
+- **Performance**
+  - セッション選択時に `refreshCustomPromptsFromDisk` が二重実行される経路を解消し、再読み込み時の待ち時間を削減
+- **Images**
+  - 画像キャッシュの prune が最新画像を先に削除して `ENOENT` になり得る問題を修正（古い画像から削除）
+- **Streaming**
+  - assistant のストリーミング delta と `item/completed` の到着順が前後した場合に、末尾が二重に表示され得る問題を修正
+- **Memory**
+  - `codez.ui.clearHistoryOnCompact` を追加。compact後にUI履歴をクリアしてメモリ使用量を抑え、必要なら `Load history` で再hydrationできるようにする
+  - compact後に残す往復数を `codez.ui.clearHistoryOnCompactKeepPairs` で指定（デフォルト 10）
+- **UI**
+  - UI上の日本語メッセージを英語へ統一（toasts / banners / blocks / quick pick 等）
+  - codez/codex セッションでもチャットブロックを描画順に再配置し、Turn 表示順がばらつくことがある問題を修正
+- **Errors**
+  - `turn` が `Failed` で完了した場合、エラーメッセージをチャット内のエラーカードとして表示（「何も起きない」ように見えるケースを低減）
+  - `error` 通知をチャット内のエラーカードとして表示
+  - `turn/started` 到着時に送信済み user ブロックへ `turnId` を後付けし、送信直後の Edit/Rewrite 判定が不安定になる回帰を修正
+- **OpenCode / Stability**
+  - opencode サーバー起動失敗時に `inFlight` 状態が残って再試行不能になる問題を修正（失敗後に再起動できるように）
+  - `request_user_input` 待機中に Webview が破棄された場合、待機を `cancelled` で解放してターンが停止し続ける問題を修正
+
+## 0.2.9
+
+- **Fix**
+  - Marketplace に publish した拡張が起動時にクラッシュし得る問題を修正（publish 時に `--no-dependencies` を使うと `@iarna/toml` / `shell-quote` が VSIX に含まれず `Cannot find module` で落ちるため、publish 手順を修正）
+
+## 0.2.8
+
+- **Slash Commands**
+  - `/apps` を追加（app 一覧から選択して `$<slug>` を入力欄へ挿入）
+  - `/apps` / `/mcp` / `/personality` の実行結果をインタラクティブなカードで表示
+  - `/personality` を追加（friendly/pragmatic を選択して、以降のターンの personality を上書き）
+  - `/collab` を追加（collaboration mode preset を選択。入力欄で Shift+Tab でも cycle）
+  - `/experimental` を追加（`shell_snapshot` / `collab` / `apps` の feature toggle）
+  - `/experimental` の保存先を codez の config layering に合わせ、`./.codex/config.toml` がある場合は repo-local へ保存
+- **Collaboration Mode**
+  - Ctrl+Shift の単一ショートカットで collaboration mode をトグル
+  - Chat view 上で Shift+Tab でもトグルできるように keybinding を追加
+  - 入力欄フォーカス時以外（チャットビュー全体）でも Ctrl+Shift トグルを検知
+  - 現在のモード表示をモデル名の左に表示
+  - モード切替時に左下の表示が即時更新されるように修正
+  - モード切替時にチャット内へシステムメッセージカードを表示
+- **Sessions / History**
+  - `/resume` の履歴ピッカーに `archived` / `sortKey` / `sourceKinds` フィルタを追加
+  - archived スレッドを選んだ場合、復元前に `thread/unarchive` を実行
+- **Sessions / Tabs**
+  - セッションタブを backendId（opencode / codez）でフィルタリング。アクティブセッションと同じ backend のセッションのみ表示されるように変更
+  - セッション番号付けを Sessions ツリーと一致（ワークスペース+backend 単位の連番）
+  - タブをドラッグ&ドロップで並び替え（プロジェクト単位 / プロジェクト内セッション単位）
+- **Approvals**
+  - approval が必要なセッションのタブを「入力待ち」と同じ強調表示にし、別タブへ移動しようとしたときに案内を表示
+- **Models**
+  - backend が返す effective model をモデルセレクタへ自動反映しない（選択 UI は「ユーザーの明示的 override」vs「default(=config)」を表す）
+  - upgrade 先が存在するモデル（`upgrade → ...`）を候補から除外して重複表示を抑制
+  - モデル候補を `id` 優先で重複排除（同名が複数返るケースの表示崩れを防止）
+  - 旧バージョンが誤って書いた「effective model を override として保持してしまう状態」を、ユーザーが明示 override していない場合に自動クリア
+  - codez セッションの `default` ラベルは、repo-local `./.codex/config.toml` を優先して表示（backend の `config/read` に合わせる）
+- **OpenCode / Agent Mode**
+  - OpenCodeのAgentモード（Build/Plan）切り替えをサポート
+  - opencodeセッション時にモデルセレクターの左にAgentセレクターを表示
+  - Agent選択時にAPIリクエストにagentパラメータを含めて送信
+  - Agentセレクターのラベルをシンプル化（"default (CLI config)" → "default"）
+- **OpenCode / Reasoning (Variant)**
+  - OpenCodeモデルで推論強度（reasoning effort）の選択をサポート（none/minimal/low/medium/high/xhigh）
+  - APIリクエストに `variant` パラメータを追加
+  - モデル一覧に `supportedReasoningEfforts` を表示し、利用可能な推論強度を示す
+  - 推論強度セレクターに "server default" を表示
+- **OpenCode / Provider Filtering**
+  - `enabled_providers` / `disabled_providers` 設定に対応し、プロバイダー一覧をフィルタリング
+  - 接続済みプロバイダーのみを表示（サーバーが connected 情報を返す場合）
+- **OpenCode / Reasoning UI Improvements**
+  - 複数の reasoning パートを1つのUIブロックに統合（opencode web と同じ表示方式）
+  - reasoning の time.end を反映し、完了時にスピナーが残り続ける問題を修正
+- **OpenCode / Tool & Message Handling**
+  - step より前に到着する tool パートを適切に処理
+  - SSE イベントパースを改善（CRLF/LF の両方に対応）
+  - 空の assistant メッセージを送信しないように修正
+  - /message 応答と SSE の二重反映でカードが重複・順序が崩れる問題を修正（SSE を唯一の描画ソースに統一）
+  - OpenCode サーバへの接続エラー時に opencode backend を破棄してキャッシュをクリーンアップ（次の操作で再起動できる状態に）
+  - delta が空の unknown part で空カード（黒いカード）が出る問題を修正
+  - カードの並び替えが UI 上で反映されない問題を修正（OpenCodeブロックのみ順序に追従して再配置）
+  - OpenCode の Part（file/patch/agent/snapshot/retry/compaction/subtask）をカード表示し、複数パートでIDが衝突して潰れる問題を修正
+  - Notice（起動時カード）が更新のたびに末尾へ移動してしまう問題を修正（Noticeは先頭に固定）
+- **OpenCode / Permissions**
+  - permission.asked を UI に表示し、Allow once / Always allow / Reject の応答をサポート（これが無いとツールが待ち状態で止まり得る）
+- **OpenCode / Server Process**
+  - opencode サーバープロセスを拡張内で共有（ワークスペースごとに `opencode serve` が増殖してフリーズ/競合しやすい問題を緩和）
+- **OpenCode / Server Info**
+  - 起動時のサーバー情報カードから Config keys と Skills の一覧表示を削除（エラー時のみ表示）
+  - codez/codex セッションで OpenCode の起動時カードが混ざる問題を修正（OpenCode started としてbackend/cwdでフィルタ）
+- **Skills**
+  - `No skills found` の案内に `./.codex/config.toml`（project）も明記（codez の config layering を反映）
+  - remote skills の一覧/ダウンロード API に対応
+  - skills のライブ更新検知に対応
 
 ## 0.2.7
 
@@ -105,12 +234,8 @@
 - **MCP**
   - セッション開始時の `MCP servers` 表示が他プロジェクトと混ざることがある問題を修正
     - セッションの `cwd` に対して `mcpServerStatus/list` を問い合わせ、設定上有効な MCP のみを表示
-- **AskUserQuestion**
-  - AskUserQuestion（`ask_user_question` tool）の UI をサポート（デフォルト無効。`config.toml` で明示的に有効化した場合のみモデルへ露出）
-    - 推奨: `[features].ask_user_question_tool = true`（互換: `[tools].ask_user_question = true`）
-    - 質問カードの表示と回答の送信
-    - 選択肢（options）のクリック選択
-    - 回答（answers）をチャット履歴に保持
+- **Tools**
+  - AskUserQuestion（`user/askQuestion` / `ask_user_question`）のサポートを削除。ユーザーへの質問は `request_user_input` に統一
 - **Webview / Performance**
   - Webview が非表示の間は state 更新を送らず、ACK 待ちもしない（表示に戻ったら `refresh` で追いつく）
   - state 更新 ACK のタイムアウトは UI エラー扱いせず、デバッグログに出す
