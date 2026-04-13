@@ -12,6 +12,8 @@ export type Session = {
   title: string;
   customTitle?: boolean;
   threadId: string;
+  lastErrorTitle?: string | null;
+  lastErrorText?: string | null;
   personality?: Personality | null;
   collaborationModePresetName?: CollaborationModeMask["name"] | null;
 };
