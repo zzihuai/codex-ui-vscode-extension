@@ -1666,6 +1666,8 @@ export function activate(context: vscode.ExtensionContext): void {
           title,
           customTitle: true,
           threadId: src.threadId,
+          lastErrorTitle: src.lastErrorTitle ?? null,
+          lastErrorText: src.lastErrorText ?? null,
           personality: src.personality ?? null,
           collaborationModePresetName: src.collaborationModePresetName ?? null,
         };
@@ -6110,6 +6112,109 @@ function normalizeSessionTitle(title: string): string {
   return withoutShortId || "(untitled)";
 }
 
+function trimErrorText(text: string, maxChars = 500): string {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function applySessionErrorState(
+  sessionId: string,
+  error: { title: string; text: string } | null,
+): void {
+  if (!sessions || !extensionContext) return;
+  const session = sessions.getById(sessionId);
+  if (!session) return;
+
+  const nextTitle = error ? trimErrorText(error.title, 120) || "Error" : null;
+  const nextText = error ? trimErrorText(error.text, 1000) || null : null;
+  if (
+    (session.lastErrorTitle ?? null) === nextTitle &&
+    (session.lastErrorText ?? null) === nextText
+  ) {
+    return;
+  }
+
+  session.lastErrorTitle = nextTitle;
+  session.lastErrorText = nextText;
+  saveSessions(extensionContext, sessions);
+  sessionTree?.refresh();
+  chatView?.refresh();
+}
+
+function buildCodexErrorPresentation(args: {
+  message?: string | null;
+  additionalDetails?: string | null;
+  willRetry?: boolean;
+  codexErrorInfo?: unknown;
+  fallbackTitle?: string;
+}): { title: string; text: string } {
+  const message = String(args.message ?? "").trim();
+  const additionalDetails = String(args.additionalDetails ?? "").trim();
+  const rawInfo = args.codexErrorInfo ?? null;
+  const infoKey =
+    typeof rawInfo === "string"
+      ? rawInfo
+      : rawInfo && typeof rawInfo === "object"
+        ? (Object.keys(rawInfo as Record<string, unknown>)[0] ?? null)
+        : null;
+  const infoValue =
+    infoKey && rawInfo && typeof rawInfo === "object"
+      ? (rawInfo as Record<string, unknown>)[infoKey]
+      : null;
+  const httpStatusCode =
+    infoValue && typeof infoValue === "object"
+      ? ((infoValue as any).httpStatusCode ??
+        (infoValue as any).http_status_code)
+      : null;
+  const resetAtRaw =
+    infoValue && typeof infoValue === "object"
+      ? ((infoValue as any).resetsAt ??
+        (infoValue as any).resetAt ??
+        (infoValue as any).resets_at)
+      : null;
+  const resetAt =
+    typeof resetAtRaw === "string" ? resetAtRaw.trim() : String(resetAtRaw ?? "").trim();
+
+  let title = args.fallbackTitle?.trim() || "Error";
+  if (infoKey === "rateLimited" || infoKey === "rate_limited") {
+    title =
+      typeof httpStatusCode === "number"
+        ? `Rate limited (HTTP ${httpStatusCode})`
+        : "Rate limited";
+  } else if (
+    infoKey === "usageLimitExceeded" ||
+    infoKey === "usage_limit_exceeded"
+  ) {
+    title = "Usage limit exceeded";
+  } else if (
+    infoKey === "contextWindowExceeded" ||
+    infoKey === "context_window_exceeded"
+  ) {
+    title = "Context window exceeded";
+  }
+
+  const lines: string[] = [];
+  if (message) lines.push(message);
+  if (additionalDetails) {
+    if (lines.length > 0) lines.push("");
+    lines.push(additionalDetails);
+  }
+  if (resetAt) {
+    if (lines.length > 0) lines.push("");
+    lines.push(`Reset at: ${resetAt}`);
+  }
+  if (args.willRetry) {
+    if (lines.length > 0) lines.push("");
+    lines.push("Will retry automatically.");
+  }
+
+  return {
+    title,
+    text: lines.join("\n").trim() || title,
+  };
+}
+
 function applyServerNotification(
   backendKey: string,
   sessionId: string,
@@ -6129,25 +6234,35 @@ function applyServerNotification(
       return;
     case "error": {
       const p = (n as any).params as {
-        error?: { message?: unknown; additionalDetails?: unknown };
+        error?: {
+          message?: unknown;
+          additionalDetails?: unknown;
+          codexErrorInfo?: unknown;
+        };
         willRetry?: unknown;
         threadId?: unknown;
         turnId?: unknown;
       };
-      const message = String(p?.error?.message ?? "").trim();
-      const additionalDetailsRaw = p?.error?.additionalDetails;
-      const additionalDetails =
-        typeof additionalDetailsRaw === "string"
-          ? String(additionalDetailsRaw).trim()
-          : "";
-      const willRetry = Boolean(p?.willRetry ?? false);
       const turnId = String(p?.turnId ?? "").trim();
+      const presentation = buildCodexErrorPresentation({
+        message:
+          typeof p?.error?.message === "string"
+            ? p.error.message
+            : String(p?.error?.message ?? ""),
+        additionalDetails:
+          typeof p?.error?.additionalDetails === "string"
+            ? p.error.additionalDetails
+            : "",
+        willRetry: Boolean(p?.willRetry ?? false),
+        codexErrorInfo: p?.error?.codexErrorInfo,
+      });
 
+      applySessionErrorState(sessionId, presentation);
       upsertBlock(sessionId, {
         id: `turn-error:${turnId || newLocalId("error")}`,
         type: "error",
-        title: willRetry ? "Error (will retry)" : "Error",
-        text: additionalDetails ? `${message}\n\n${additionalDetails}` : message,
+        title: presentation.title,
+        text: presentation.text,
       });
       chatView?.refresh();
       return;
@@ -6205,6 +6320,7 @@ function applyServerNotification(
       rt.lastTurnStartedAtMs = Date.now();
       rt.lastTurnCompletedAtMs = null;
       rt.activeTurnId = String((n as any).params?.turn?.id ?? "") || null;
+      applySessionErrorState(sessionId, null);
       const binding = resolvePendingLocalUserBlockBinding({
         activeTurnId: rt.activeTurnId,
         pendingLocalUserBlockId: rt.pendingLocalUserBlockId,
@@ -6266,22 +6382,26 @@ function applyServerNotification(
         const status = String(turn?.status ?? "");
         if (status === "Failed") {
           const turnId = String(turn?.id ?? "").trim();
-          const message = String(turn?.error?.message ?? "").trim();
-          const additionalDetailsRaw = turn?.error?.additionalDetails;
-          const additionalDetails =
-            typeof additionalDetailsRaw === "string"
-              ? String(additionalDetailsRaw).trim()
-              : "";
-          if (message) {
-            upsertBlock(sessionId, {
-              id: `turn-error:${turnId || newLocalId("error")}`,
-              type: "error",
-              title: "Turn failed",
-              text: additionalDetails
-                ? `${message}\n\n${additionalDetails}`
-                : message,
-            });
-          }
+          const presentation = buildCodexErrorPresentation({
+            message:
+              typeof turn?.error?.message === "string"
+                ? turn.error.message
+                : String(turn?.error?.message ?? ""),
+            additionalDetails:
+              typeof turn?.error?.additionalDetails === "string"
+                ? turn.error.additionalDetails
+                : "",
+            fallbackTitle: "Turn failed",
+          });
+          applySessionErrorState(sessionId, presentation);
+          upsertBlock(sessionId, {
+            id: `turn-error:${turnId || newLocalId("error")}`,
+            type: "error",
+            title: presentation.title,
+            text: presentation.text,
+          });
+        } else {
+          applySessionErrorState(sessionId, null);
         }
       }
       // IMPORTANT: clear the streaming set before flushing pending deltas so the webview sees
@@ -6643,69 +6763,24 @@ function applyServerNotification(
         willRetry?: unknown;
       };
       const err = p?.error ?? {};
-      const rawMessage =
-        typeof err?.message === "string"
-          ? err.message
-          : String(err?.message ?? "");
-      const message = rawMessage.trim();
-
-      const additionalDetails =
-        typeof err?.additionalDetails === "string"
-          ? err.additionalDetails.trim()
-          : "";
-
-      const rawInfo = err?.codexErrorInfo ?? null;
-      const infoKey =
-        typeof rawInfo === "string"
-          ? rawInfo
-          : rawInfo && typeof rawInfo === "object"
-            ? (Object.keys(rawInfo as Record<string, unknown>)[0] ?? null)
-            : null;
-      const infoValue =
-        infoKey && rawInfo && typeof rawInfo === "object"
-          ? (rawInfo as Record<string, unknown>)[infoKey]
-          : null;
-      const httpStatusCode =
-        infoValue && typeof infoValue === "object"
-          ? ((infoValue as any).httpStatusCode ??
-            (infoValue as any).http_status_code)
-          : null;
-
-      const willRetry = !!p?.willRetry;
-
-      let title = "Error";
-      if (infoKey === "rateLimited" || infoKey === "rate_limited") {
-        title =
-          typeof httpStatusCode === "number"
-            ? `Rate limited (HTTP ${httpStatusCode})`
-            : "Rate limited";
-      } else if (
-        infoKey === "usageLimitExceeded" ||
-        infoKey === "usage_limit_exceeded"
-      ) {
-        title = "Usage limit exceeded";
-      } else if (
-        infoKey === "contextWindowExceeded" ||
-        infoKey === "context_window_exceeded"
-      ) {
-        title = "Context window exceeded";
-      }
-
-      const lines: string[] = [];
-      if (message) lines.push(message);
-      if (additionalDetails) {
-        if (lines.length > 0) lines.push("");
-        lines.push(additionalDetails);
-      }
-      if (willRetry) {
-        if (lines.length > 0) lines.push("");
-        lines.push("Will retry automatically.");
-      }
+      const presentation = buildCodexErrorPresentation({
+        message:
+          typeof err?.message === "string"
+            ? err.message
+            : String(err?.message ?? ""),
+        additionalDetails:
+          typeof err?.additionalDetails === "string"
+            ? err.additionalDetails
+            : "",
+        codexErrorInfo: err?.codexErrorInfo,
+        willRetry: !!p?.willRetry,
+      });
+      applySessionErrorState(sessionId, presentation);
       upsertBlock(sessionId, {
         id: newLocalId("error"),
         type: "error",
-        title,
-        text: lines.join("\n").trim(),
+        title: presentation.title,
+        text: presentation.text,
       });
       chatView?.refresh();
       return;
@@ -9168,6 +9243,8 @@ type PersistedSessionV2 = Pick<
   | "title"
   | "threadId"
   | "customTitle"
+  | "lastErrorTitle"
+  | "lastErrorText"
   | "personality"
   | "collaborationModePresetName"
 >;
@@ -9227,6 +9304,8 @@ function loadSessions(
     const threadId = o["threadId"];
     const personality = o["personality"];
     const collaborationModePresetName = o["collaborationModePresetName"];
+    const lastErrorTitle = o["lastErrorTitle"];
+    const lastErrorText = o["lastErrorText"];
 
     if (
       typeof id !== "string" ||
@@ -9259,6 +9338,14 @@ function loadSessions(
       title,
       customTitle: typeof customTitle === "boolean" ? customTitle : false,
       threadId,
+      lastErrorTitle:
+        typeof lastErrorTitle === "string" && lastErrorTitle.trim()
+          ? lastErrorTitle.trim()
+          : null,
+      lastErrorText:
+        typeof lastErrorText === "string" && lastErrorText.trim()
+          ? lastErrorText.trim()
+          : null,
       personality: personalityVal,
       collaborationModePresetName: collaborationModePresetNameVal,
     });
@@ -9284,6 +9371,8 @@ function toPersistedSessionV2(session: Session): PersistedSessionV2 {
     title,
     customTitle,
     threadId,
+    lastErrorTitle,
+    lastErrorText,
     personality,
     collaborationModePresetName,
   } = session;
@@ -9295,6 +9384,8 @@ function toPersistedSessionV2(session: Session): PersistedSessionV2 {
     title,
     customTitle,
     threadId,
+    lastErrorTitle: lastErrorTitle ?? null,
+    lastErrorText: lastErrorText ?? null,
     personality: personality ?? null,
     collaborationModePresetName: collaborationModePresetName ?? null,
   };

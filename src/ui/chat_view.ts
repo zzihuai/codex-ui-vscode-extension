@@ -1861,6 +1861,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       details.notice { background: rgba(127,127,127,0.04); }
       details.notice.info { background: rgba(255,255,255,0.06); }
       details.notice.debug { background: rgba(255, 185, 0, 0.08); }
+      details.notice.error, details.errorCard { border-color: rgba(220, 60, 60, 0.55); background: rgba(220, 60, 60, 0.12); }
+      details.notice.error > summary, details.errorCard > summary { color: var(--vscode-errorForeground, #f14c4c); }
       details > summary { cursor: pointer; font-weight: 600; position: relative; padding-right: 8px; display: flex; align-items: center; gap: 8px; }
       details > summary > span[data-k="summaryText"] { flex: 1 1 auto; min-width: 0; }
       details > summary > span.statusIcon { position: static; top: auto; right: auto; transform: none; margin-left: auto; }

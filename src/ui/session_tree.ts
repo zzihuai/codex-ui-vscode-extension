@@ -54,7 +54,8 @@ export class SessionTreeDataProvider
     const idx = this.getWorkspaceColorIndex(element.session.workspaceFolderUri);
     item.iconPath = iconForColorIndex(this.extensionUri, idx);
     // Put backend + thread id in the same line to avoid an extra backend group row.
-    item.description = `${element.session.backendId} ${element.session.threadId}`;
+    item.description = formatSessionDescription(element.session);
+    item.tooltip = buildSessionTooltip(element.session);
     item.contextValue = "codez.session";
     item.command = {
       command: "codez.openSession",
@@ -125,6 +126,43 @@ function normalizeTitle(title: string): string {
   const t = title.trim();
   const withoutShortId = t.replace(/\s*\([0-9a-f]{8}\)\s*$/i, "").trim();
   return withoutShortId.length > 0 ? withoutShortId : "(untitled)";
+}
+
+function formatSessionDescription(session: Session): string {
+  const base = `${session.backendId} ${session.threadId}`;
+  const errorTitle = String(session.lastErrorTitle ?? "").trim();
+  if (!errorTitle) return base;
+  return `${base}  ${truncateOneLine(errorTitle, 40)}`;
+}
+
+function buildSessionTooltip(session: Session): vscode.MarkdownString {
+  const tooltip = new vscode.MarkdownString(undefined, true);
+  tooltip.isTrusted = false;
+  tooltip.appendMarkdown(`**${escapeMarkdown(normalizeTitle(session.title))}**`);
+  tooltip.appendMarkdown(
+    `\n\nBackend: \`${escapeMarkdown(session.backendId)}\``,
+  );
+  tooltip.appendMarkdown(
+    `\nThread: \`${escapeMarkdown(session.threadId)}\``,
+  );
+  const errorTitle = String(session.lastErrorTitle ?? "").trim();
+  const errorText = String(session.lastErrorText ?? "").trim();
+  if (errorTitle || errorText) {
+    tooltip.appendMarkdown("\n\n$(error) Last error");
+    if (errorTitle) tooltip.appendMarkdown(`\n${escapeMarkdown(errorTitle)}`);
+    if (errorText) tooltip.appendCodeblock(errorText, "text");
+  }
+  return tooltip;
+}
+
+function truncateOneLine(text: string, maxChars: number): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxChars) return oneLine;
+  return `${oneLine.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function escapeMarkdown(text: string): string {
+  return text.replace(/([\\`*_{}[\]()#+\-.!|>])/g, "\\$1");
 }
 
 function toFolderLabel(session: Session | null): string | null {

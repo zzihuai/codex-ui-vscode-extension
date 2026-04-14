@@ -44,4 +44,11 @@ describe("chat_view_client contract", () => {
     expect(src).toContain("if (block.type === \"collab\")");
     expect(src).toContain("placeTopLevel(det);");
   });
+
+  it("renders error blocks as dedicated error cards", async () => {
+    const filePath = path.resolve(__dirname, "../../src/ui/chat_view_client.ts");
+    const src = await fs.readFile(filePath, "utf8");
+
+    expect(src).toContain("\"notice error errorCard\"");
+  });
 });

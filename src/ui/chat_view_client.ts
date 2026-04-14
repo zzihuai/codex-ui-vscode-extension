@@ -5505,7 +5505,7 @@ function main(): void {
         const id = "error:" + block.id;
         const det = ensureDetails(
           id,
-          "system",
+          "notice error errorCard",
           true,
           "Error: " + block.title,
           id,
