@@ -16,6 +16,11 @@ declare const markdownit:
       renderer: { rules: Record<string, any> };
     });
 
+declare var katex: {
+  render: (latex: string, node: HTMLElement, options?: Record<string, unknown>) => void;
+  renderToString: (latex: string, options?: Record<string, unknown>) => string;
+};
+
 type Session = {
   id: string;
   title: string;
@@ -2989,10 +2994,133 @@ function main(): void {
     delete detailsState[key];
   }
 
+  // Render display math ($$...$$) BEFORE markdown-it processing so that
+  // LaTeX syntax (_ ^ \ etc.) is not misinterpreted as markdown formatting.
+  // Split the raw text on $$...$$ boundaries, render text segments with
+  // markdown-it and math segments with KaTeX, then concatenate.
+  function renderMarkdownWithDisplayMath(text: string): string {
+    if (typeof katex === "undefined") return md.render(text);
+
+    // Protect inline code spans so $$ inside backticks doesn't split incorrectly
+    const codeSpans: string[] = [];
+    const stage1 = text.replace(/`([^`]+)`/g, (_m: string, c: string) => {
+      codeSpans.push(c);
+      return "CS" + (codeSpans.length - 1) + "";
+    });
+
+    // Split on $$...$$ (non-greedy, across lines)
+    const parts = stage1.split(/(\$\$[\s\S]+?\$\$)/g);
+
+    let result = "";
+    for (const part of parts) {
+      if (part.startsWith("$$") && part.endsWith("$$") && part.length > 4) {
+        const math = part.slice(2, -2).trim();
+        if (math) {
+          try {
+            result += katex.renderToString(math, { displayMode: true, throwOnError: false });
+          } catch (_e) {
+            result += part;
+          }
+        }
+      } else {
+        let html = md.render(part);
+        html = html.replace(/CS(\d+)/g, (_m: string, i: string) => {
+          const idx = parseInt(i);
+          return idx < codeSpans.length ? "`" + codeSpans[idx] + "`" : "";
+        });
+        result += html;
+      }
+    }
+
+    return result;
+  }
+
+  function renderMath(root: HTMLElement): void {
+    if (typeof katex === "undefined") return;
+
+    // Collect text nodes (skip <code> and <pre>)
+    const textNodes: Text[] = [];
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (tw.nextNode()) {
+      const el = tw.currentNode.parentElement;
+      if (el && (el.tagName === "CODE" || el.tagName === "PRE")) continue;
+      textNodes.push(tw.currentNode as Text);
+    }
+
+    type MathFrag = { kind: "math"; math: string; display: boolean };
+    type Frag = string | MathFrag;
+
+    for (const node of textNodes) {
+      const text = node.textContent || "";
+      if (text.indexOf("$") === -1) continue;
+
+      const frags: Frag[] = [];
+      let rem = text;
+
+      while (rem) {
+        const dd = rem.indexOf("$$");
+        const d = rem.indexOf("$");
+
+        if (d === -1) {
+          frags.push(rem);
+          break;
+        }
+
+        // Display math $$...$$ (same-text-node fallback)
+        if (dd !== -1 && dd === d) {
+          const close = rem.indexOf("$$", dd + 2);
+          if (close !== -1 && close > dd + 2) {
+            if (dd > 0) frags.push(rem.substring(0, dd));
+            frags.push({ kind: "math", math: rem.substring(dd + 2, close), display: true });
+            rem = rem.substring(close + 2);
+            continue;
+          }
+          frags.push(rem.substring(0, d + 2));
+          rem = rem.substring(d + 2);
+          continue;
+        }
+
+        // Inline math $...$
+        if (d > 0) frags.push(rem.substring(0, d));
+        const close = rem.indexOf("$", d + 1);
+        if (close !== -1 && close > d + 1) {
+          frags.push({ kind: "math", math: rem.substring(d + 1, close), display: false });
+          rem = rem.substring(close + 1);
+        } else {
+          frags.push(rem.substring(d));
+          rem = "";
+        }
+      }
+
+      if (frags.length <= 1) continue;
+
+      const parent = node.parentNode;
+      if (!parent) continue;
+      for (const frag of frags) {
+        if (typeof frag === "string") {
+          parent.insertBefore(document.createTextNode(frag), node);
+        } else {
+          const span = document.createElement("span");
+          try {
+            katex.render(frag.math, span, {
+              displayMode: frag.display,
+              throwOnError: false,
+            });
+          } catch (_e) {
+            span.textContent = (frag.display ? "$$" : "$") + frag.math + (frag.display ? "$$" : "$");
+          }
+          parent.insertBefore(span, node);
+        }
+      }
+      parent.removeChild(node);
+    }
+  }
+
   function renderMarkdownInto(el: HTMLElement, text: string): void {
     if (el.dataset.src === text) return;
     el.dataset.src = text;
-    el.innerHTML = md.render(text);
+    el.innerHTML = renderMarkdownWithDisplayMath(text);
+    renderMath(el);
     delete (el.dataset as any).fileLinks;
     linkifyFilePaths(el);
   }

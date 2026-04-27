@@ -1730,8 +1730,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const csp = [
       "default-src 'none'",
       "img-src " + webview.cspSource + " data: blob:",
-      "style-src 'unsafe-inline'",
+      "style-src 'unsafe-inline' " + webview.cspSource + " https://cdn.jsdelivr.net",
       `script-src ${webview.cspSource} 'nonce-${nonce}'`,
+      "font-src " + webview.cspSource + " https://cdn.jsdelivr.net",
     ].join("; ");
 
     const clientScriptUri = webview.asWebviewUri(
@@ -1750,10 +1751,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "markdown-it.min.js",
       ),
     );
+    const katexJsUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(
+        this.context.extensionUri,
+        "resources",
+        "vendor",
+        "katex.min.js",
+      ),
+    );
     const cacheBusted = (uri: vscode.Uri): vscode.Uri =>
       uri.with({ query: `v=${nonce}` });
     const clientScriptUriV = cacheBusted(clientScriptUri);
     const markdownItUriV = cacheBusted(markdownItUri);
+    const katexJsUriV = cacheBusted(katexJsUri);
 
     return `<!doctype html>
 <html lang="ja">
@@ -1761,6 +1771,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy" content="${csp}" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/katex.min.css" />
     <style>
       :root {
         --cm-font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
@@ -2005,6 +2016,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .settingsListItem:hover { border-color: rgba(127,127,127,0.35); background: rgba(127,127,127,0.06); }
         .settingsListItem.active { border-color: rgba(0,120,212,0.55); background: rgba(0,120,212,0.12); }
         .settingsListMeta { opacity: 0.8; font-size: 12px; }
+      .md .katex-display { overflow-x: auto; overflow-y: hidden; }
+      .md .katex { font-size: 1.05em; }
 		    </style>
 		  </head>
 		  <body>
@@ -2057,6 +2070,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 	    </div>
 	    <div id="toast" class="toast"></div>
 	    <script nonce="${nonce}" src="${markdownItUriV}"></script>
+		<script nonce="${nonce}" src="${katexJsUriV}"></script>
 	    <script nonce="${nonce}" src="${clientScriptUriV}"></script>
 	  </body>
 	</html>`;
